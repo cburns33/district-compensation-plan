@@ -1,0 +1,12 @@
+# Google service account credentials — never commit these
+*.json
+
+# Environment variables
+.env
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc

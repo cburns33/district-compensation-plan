@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 import tldextract
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # ── Google Sheets auth (skipped in dry-run) ──────────────────────────────────
@@ -185,7 +187,6 @@ def qa_check(url: str, logger: logging.Logger) -> str:
             timeout=QA_TIMEOUT,
             allow_redirects=True,
             headers=headers,
-            max_redirects=5,
         )
         final_url = resp.url
         ct = resp.headers.get("Content-Type", "").lower()
@@ -218,11 +219,86 @@ def qa_check(url: str, logger: logging.Logger) -> str:
         return "⚠ REVIEW"
 
 
+# ── Tier-2 HTML crawl ────────────────────────────────────────────────────────
+
+SALARY_LINK_RE = re.compile(
+    r'compensation|salary|pay.?scale|pay.?plan|pay.?schedule|wage',
+    re.IGNORECASE,
+)
+DOC_EXT_RE = re.compile(r'\.(pdf|xlsx|xls|docx)(\?.*)?$', re.IGNORECASE)
+
+
+def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
+    """
+    Fetch an HTML page and search its links for salary/compensation documents.
+    Prefers PDF/XLSX links; falls back to any salary-keyword HTML link.
+    Returns the best URL found, or '' if nothing relevant is detected.
+    """
+    try:
+        resp = requests.get(
+            page_url, timeout=8,
+            headers={"User-Agent": QA_USER_AGENT},
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        doc_hits  = []  # links to PDF/XLSX/etc. with salary keywords
+        html_hits = []  # plain HTML links with salary keywords
+
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"].strip()
+            if not href or href.startswith(("mailto:", "tel:", "#")):
+                continue
+            text     = tag.get_text(" ", strip=True)
+            combined = f"{href} {text}"
+            if not SALARY_LINK_RE.search(combined):
+                continue
+            full_url = urljoin(page_url, href)
+            if DOC_EXT_RE.search(href):
+                doc_hits.append(full_url)
+            else:
+                html_hits.append(full_url)
+
+        if doc_hits:
+            logger.info("Crawl found %d doc link(s) on %s → %s", len(doc_hits), page_url, doc_hits[0])
+            return doc_hits[0]
+        if html_hits:
+            logger.info("Crawl found %d HTML link(s) on %s → %s", len(html_hits), page_url, html_hits[0])
+            return html_hits[0]
+        return ""
+
+    except Exception as exc:
+        logger.warning("HTML crawl error for %s: %s", page_url, exc)
+        return ""
+
+
+# ── Tier-3 domain-scoped search ───────────────────────────────────────────────
+
+def call_serper_domain(homepage_url: str, api_key: str, logger: logging.Logger):
+    """
+    Tier-3: fire a site:-scoped Serper query restricted to the district's own
+    domain. Used when the primary search winner lands on the wrong district's
+    domain. Returns up to 10 results (same format as call_serper).
+    """
+    domain = tldextract.extract(homepage_url).registered_domain
+    if not domain:
+        return []
+    query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan"'
+    logger.info("Tier-3 domain search: %s", query)
+    try:
+        return call_serper(query, api_key, logger)
+    except Exception as exc:
+        logger.warning("Tier-3 Serper call failed: %s", exc)
+        return []
+
+
 # ── Serper API ────────────────────────────────────────────────────────────────
 
 def call_serper(query: str, api_key: str, logger: logging.Logger):
     """
-    Call Serper.dev and return up to 2 organic results as a list of dicts
+    Call Serper.dev and return up to 10 organic results as a list of dicts
     with keys: link, title, snippet.
     On failure, raises after one retry.
     """
@@ -244,7 +320,7 @@ def call_serper(query: str, api_key: str, logger: logging.Logger):
             data = resp.json()
             organic = data.get("organic", [])
             results = []
-            for item in organic[:2]:
+            for item in organic[:10]:
                 results.append({
                     "link":    item.get("link", "NO_RESULT"),
                     "title":   item.get("title", ""),
@@ -260,19 +336,21 @@ def call_serper(query: str, api_key: str, logger: logging.Logger):
 
 
 def _pad_results(results):
-    """Ensure exactly 2 result slots, filling missing ones with NO_RESULT."""
-    while len(results) < 2:
+    """Ensure exactly 10 result slots, filling missing ones with NO_RESULT."""
+    while len(results) < 10:
         results.append({"link": "NO_RESULT", "title": "NO_RESULT", "snippet": ""})
-    return results[:2]
+    return results[:10]
 
 
 # ── Google Sheets helpers ─────────────────────────────────────────────────────
 
+WORKSHEET_NAME = "Unique Districts"
+
 def open_sheet(creds_path: str, spreadsheet_id: str):
-    """Authenticate and return the first worksheet."""
+    """Authenticate and return the 'Unique Districts' worksheet."""
     creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
     client = gspread.authorize(creds)
-    return client.open_by_key(spreadsheet_id).sheet1
+    return client.open_by_key(spreadsheet_id).worksheet(WORKSHEET_NAME)
 
 
 def ensure_headers(sheet) -> None:
@@ -282,7 +360,7 @@ def ensure_headers(sheet) -> None:
         return  # headers already present
     # Build the update values — one list of 7
     cell_range = _row_range(1)
-    sheet.update(cell_range, [HEADERS_ROW], value_input_option="USER_ENTERED")
+    sheet.update(range_name=cell_range, values=[HEADERS_ROW], value_input_option="USER_ENTERED")
 
 
 def flush_batch(sheet, buffer: list) -> None:
@@ -482,6 +560,14 @@ def parse_args():
         "--dry-run", action="store_true",
         help="Run scoring/QA logic against hardcoded mock data; no API or Sheet calls",
     )
+    parser.add_argument(
+        "--first-n", type=int, default=None,
+        help="Process only the first N data rows (e.g. 10 largest districts)",
+    )
+    parser.add_argument(
+        "--last-n", type=int, default=None,
+        help="Process only the last N data rows (e.g. 10 smallest districts)",
+    )
     return parser.parse_args()
 
 
@@ -502,7 +588,13 @@ def main():
     # ── Credentials ───────────────────────────────────────────────────────────
     load_dotenv()
     serper_key     = os.environ.get("SERPER_API_KEY", "").strip()
-    creds_path     = os.environ.get("GOOGLE_SHEETS_CREDS_JSON", "").strip()
+    creds_path_raw = os.environ.get("GOOGLE_SHEETS_CREDS_JSON", "").strip()
+    # Resolve relative paths from the project directory so .env is portable
+    # across machines (Mac, Windows) regardless of absolute folder locations.
+    creds_path_obj = Path(creds_path_raw).expanduser()
+    if not creds_path_obj.is_absolute():
+        creds_path_obj = Path(__file__).parent / creds_path_obj
+    creds_path = str(creds_path_obj)
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
 
     missing = []
@@ -536,15 +628,29 @@ def main():
     end_row   = args.end_row if args.end_row else total_data_rows
     end_row   = min(end_row, total_data_rows)
 
-    total_rows = end_row - start_row + 1
-    logger.info("Processing rows %d–%d (%d total)", start_row, end_row, total_rows)
+    # Build explicit row set when --first-n / --last-n are used
+    if args.first_n or args.last_n:
+        row_set = set()
+        if args.first_n:
+            first_end = min(start_row + args.first_n - 1, end_row)
+            row_set.update(range(start_row, first_end + 1))
+            logger.info("--first-n %d: rows %d–%d", args.first_n, start_row, first_end)
+        if args.last_n:
+            last_start = max(end_row - args.last_n + 1, start_row)
+            row_set.update(range(last_start, end_row + 1))
+            logger.info("--last-n %d: rows %d–%d", args.last_n, last_start, end_row)
+        rows_to_process = sorted(row_set)
+        logger.info("Sample mode: %d rows selected", len(rows_to_process))
+    else:
+        rows_to_process = list(range(start_row, end_row + 1))
+        logger.info("Processing rows %d–%d (%d total)", start_row, end_row, len(rows_to_process))
 
     batch_buffer = []
     start_time   = time.time()
     processed    = 0
     skipped      = 0
 
-    for sheet_row in range(start_row, end_row + 1):
+    for sheet_row in rows_to_process:
         row_data = all_values[sheet_row - 1]  # 0-indexed
 
         def get_col(col_1based):
@@ -566,7 +672,7 @@ def main():
             continue
 
         row_start = time.time()
-        query = f"{district_name} compensation plan 2026"
+        query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"'
         logger.info("Row %d | %s | Query: %s", sheet_row, district_name, query)
 
         # ── Serper call ───────────────────────────────────────────────────────
@@ -581,20 +687,77 @@ def main():
             r2_url, r2_title, r2_snippet = results[1]["link"], results[1]["title"], results[1]["snippet"]
         except Exception as exc:
             logger.error("Row %d: Serper failed after retry: %s", sheet_row, exc)
+            results = _pad_results([])
             r1_url = "API_ERROR"
 
-        # ── Scoring ───────────────────────────────────────────────────────────
-        s1, reasons1 = score_result(r1_url, r1_title, r1_snippet, homepage_url)
-        s2, reasons2 = score_result(r2_url, r2_title, r2_snippet, homepage_url)
-        best_url, best_label = pick_winner(r1_url, s1, r2_url, s2)
+        # ── Scoring across all 10 results (fallback to R3–R10 automatically) ──
+        scored = []
+        for i, r in enumerate(results, start=1):
+            if r["link"] in ("NO_RESULT", "API_ERROR"):
+                scored.append((i, r["link"], 0, []))
+                continue
+            si, ri = score_result(r["link"], r["title"], r["snippet"], homepage_url)
+            scored.append((i, r["link"], si, ri))
+
+        s1, reasons1 = scored[0][2], scored[0][3]
+        s2, reasons2 = scored[1][2], scored[1][3]
+
+        # Pick best: highest score, ties go to lowest result index
+        best_idx, best_url, best_score, _ = max(scored, key=lambda x: x[2])
+        if best_score > 0:
+            suffix = " +fallback" if best_idx > 2 else ""
+            best_label = f"R{best_idx}:{best_score}pts{suffix}"
+        else:
+            best_label = f"R{best_idx}:0pts (no clear winner)"
 
         logger.info(
-            "Row %d | %s | R1=%dpts %s | R2=%dpts %s | Best=%s",
-            sheet_row, district_name, s1, reasons1, s2, reasons2, best_label,
+            "Row %d | %s | R1=%dpts %s | R2=%dpts %s | Best=R%d:%dpts",
+            sheet_row, district_name, s1, reasons1, s2, reasons2, best_idx, best_score,
         )
 
         # ── QA ────────────────────────────────────────────────────────────────
         qa_status = qa_check(best_url, logger)
+
+        # ── Tier-2: crawl HTML pages for a deeper document link ───────────────
+        if qa_status == "✓ HTML":
+            crawled = crawl_html_for_salary_doc(best_url, logger)
+            if crawled and crawled != best_url:
+                logger.info("Row %d | Tier-2 crawl upgraded URL: %s → %s", sheet_row, best_url, crawled)
+                best_url   = crawled
+                best_label = best_label + " +crawl"
+                qa_status  = qa_check(best_url, logger)
+
+        # ── Tier-3: domain-scoped search if winner is on wrong domain ─────────
+        home_domain = tldextract.extract(homepage_url).registered_domain if homepage_url else ""
+        best_domain = tldextract.extract(best_url).registered_domain if best_url not in ("NO_RESULT", "API_ERROR") else ""
+        if home_domain and best_domain and best_domain != home_domain:
+            logger.info(
+                "Row %d | Tier-3: domain mismatch (%s ≠ %s), running site search",
+                sheet_row, best_domain, home_domain,
+            )
+            t3_results = call_serper_domain(homepage_url, serper_key, logger)
+            t3_results = _pad_results(t3_results)
+            t3_scored = []
+            for r in t3_results:
+                if r["link"] in ("NO_RESULT", "API_ERROR"):
+                    continue
+                si, _ = score_result(r["link"], r["title"], r["snippet"], homepage_url)
+                t3_scored.append((r["link"], si))
+            if t3_scored:
+                t3_url, t3_score = max(t3_scored, key=lambda x: x[1])
+                if t3_score >= best_score:  # upgrade if Tier-3 is at least as good
+                    logger.info("Row %d | Tier-3 upgraded: %s (%dpts)", sheet_row, t3_url, t3_score)
+                    best_url   = t3_url
+                    best_label = f"T3:{t3_score}pts +domain"
+                    qa_status  = qa_check(best_url, logger)
+                    # Tier-2 crawl on Tier-3 result if HTML
+                    if qa_status == "✓ HTML":
+                        crawled = crawl_html_for_salary_doc(best_url, logger)
+                        if crawled and crawled != best_url:
+                            best_url   = crawled
+                            best_label = best_label + " +crawl"
+                            qa_status  = qa_check(best_url, logger)
+
         logger.info("Row %d | QA: %s | time=%.1fs", sheet_row, qa_status, time.time() - row_start)
 
         # ── Buffer row ────────────────────────────────────────────────────────
