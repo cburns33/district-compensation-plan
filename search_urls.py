@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -17,6 +18,12 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Force UTF-8 on Windows console so checkmark/warning symbols print correctly
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import requests
 import tldextract
@@ -48,13 +55,19 @@ COL_BEST_URL    = 10  # J
 COL_BEST_SCORE  = 11  # K
 COL_QA_STATUS   = 12  # L
 
-WRITE_COL_MIN = COL_R1_URL    # 6  (F)
-WRITE_COL_MAX = COL_QA_STATUS # 12 (L)
+COL_BEST_URL_CLASS = 12  # L
+COL_SEARCH_METHOD  = 13  # M
+COL_QA_STATUS      = 14  # N  (updated — shifted by 2 new cols)
+COL_REDIRECT_URL   = 15  # O
+
+WRITE_COL_MIN = COL_R1_URL       # 6  (F)
+WRITE_COL_MAX = COL_REDIRECT_URL # 15 (O)
 
 HEADERS_ROW = [
     "Result_1_URL", "Result_1_Title",
     "Result_2_URL", "Result_2_Title",
-    "Best_URL", "Best_Score", "QA_Status",
+    "Best_URL", "Best_Score", "Best_URL_Classification",
+    "Search_Method", "QA_Status", "Redirect_URL",
 ]
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
@@ -62,6 +75,13 @@ RATE_LIMIT_SLEEP = 1.5   # seconds between Serper calls
 RETRY_SLEEP      = 4.0   # seconds before retrying a failed Serper call
 QA_TIMEOUT       = 6     # seconds for HEAD request
 BATCH_SIZE       = 25    # rows to accumulate before flushing to Sheets
+
+# If the primary (year-qualified) query produces a best score at or below this
+# threshold, fire a second year-free query and take whichever result wins.
+# Set to 3 so that results like stale news articles (3pts) still trigger the
+# fallback — raised from 2 after Sulphur Springs ISD case revealed 3pt results
+# from 2019 news articles were suppressing the correct district page.
+FALLBACK_SCORE_THRESHOLD = 3
 
 NEWS_PENALTY_DOMAINS = [
     "reddit", "facebook", "twitter", "chron", "kut", "kxan",
@@ -251,11 +271,16 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
             href = tag["href"].strip()
             if not href or href.startswith(("mailto:", "tel:", "#")):
                 continue
+            full_url = urljoin(page_url, href)
+            # Filter out social/news domains — catches share buttons whose
+            # encoded ?u= parameter contains salary keywords (Willis ISD pattern)
+            result_domain = tldextract.extract(full_url).registered_domain or ""
+            if any(bad in result_domain for bad in NEWS_PENALTY_DOMAINS):
+                continue
             text     = tag.get_text(" ", strip=True)
             combined = f"{href} {text}"
             if not SALARY_LINK_RE.search(combined):
                 continue
-            full_url = urljoin(page_url, href)
             if DOC_EXT_RE.search(href):
                 doc_hits.append(full_url)
             else:
@@ -272,6 +297,23 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
     except Exception as exc:
         logger.warning("HTML crawl error for %s: %s", page_url, exc)
         return ""
+
+
+# ── Tier-1.5 year-free fallback search ───────────────────────────────────────
+
+def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger):
+    """
+    Fallback query without any year qualifier. Used when the primary
+    year-qualified search scores <= FALLBACK_SCORE_THRESHOLD, which happens
+    for small districts whose content isn't year-tagged.
+    """
+    query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan"'
+    logger.info("Tier-1.5 year-free fallback: %s", query)
+    try:
+        return call_serper(query, api_key, logger)
+    except Exception as exc:
+        logger.warning("Tier-1.5 fallback failed: %s", exc)
+        return []
 
 
 # ── Tier-3 domain-scoped search ───────────────────────────────────────────────
@@ -577,6 +619,40 @@ def elapsed_str(start_time: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def parse_best_label(label: str):
+    """
+    Split a Best_Score label into its three column components.
+
+    "R2:6pts +noyear +fixed" → score_str="6", classification="R2", method="+noyear +fixed"
+    "T3:5pts +domain"        → score_str="5", classification="T3", method="+domain"
+    "R1:0pts (no clear winner)" → score_str="0", classification="R1", method=""
+    """
+    cls_match      = re.match(r'^(R\d+|R\?|T\d+)', label)
+    classification = cls_match.group(1) if cls_match else ""
+
+    score_match = re.search(r':(\d+)pts', label)
+    score_str   = score_match.group(1) if score_match else "0"
+
+    methods       = re.findall(r'\+\w+', label)
+    search_method = " ".join(methods)
+
+    return score_str, classification, search_method
+
+
+def extract_redirect_url(qa_status: str) -> str:
+    """Return the URL portion of '⚠ REDIRECT → https://...' or ''."""
+    if "→" in qa_status:
+        return qa_status.split("→", 1)[1].strip()
+    return ""
+
+
+def clean_qa_status(qa_status: str) -> str:
+    """Strip the appended URL from redirect statuses, leaving just '⚠ REDIRECT'."""
+    if qa_status.startswith("⚠ REDIRECT"):
+        return "⚠ REDIRECT"
+    return qa_status
+
+
 def main():
     args = parse_args()
     logger = setup_logger(args.dry_run)
@@ -715,6 +791,29 @@ def main():
             sheet_row, district_name, s1, reasons1, s2, reasons2, best_idx, best_score,
         )
 
+        # ── Tier-1.5: year-free fallback if primary score is too low ──────────
+        if best_score <= FALLBACK_SCORE_THRESHOLD:
+            logger.info(
+                "Row %d | Primary best=%dpts <= threshold=%d, firing year-free fallback",
+                sheet_row, best_score, FALLBACK_SCORE_THRESHOLD,
+            )
+            time.sleep(RATE_LIMIT_SLEEP)
+            fb_results = call_serper_noyear(district_name, serper_key, logger)
+            fb_results = _pad_results(fb_results)
+            for r in fb_results:
+                if r["link"] in ("NO_RESULT", "API_ERROR"):
+                    continue
+                si, _ = score_result(r["link"], r["title"], r["snippet"], homepage_url)
+                if si > best_score:
+                    logger.info(
+                        "Row %d | Tier-1.5 upgraded: %s (%dpts > %dpts)",
+                        sheet_row, r["link"], si, best_score,
+                    )
+                    best_url   = r["link"]
+                    best_score = si
+                    best_label = f"R?:{si}pts +noyear"
+                    break  # take first (highest-ranked) improvement
+
         # ── QA ────────────────────────────────────────────────────────────────
         qa_status = qa_check(best_url, logger)
 
@@ -761,7 +860,15 @@ def main():
         logger.info("Row %d | QA: %s | time=%.1fs", sheet_row, qa_status, time.time() - row_start)
 
         # ── Buffer row ────────────────────────────────────────────────────────
-        row_values = [r1_url, r1_title, r2_url, r2_title, best_url, best_label, qa_status]
+        score_str, classification, search_method = parse_best_label(best_label)
+        redirect_url = extract_redirect_url(qa_status)
+        qa_clean     = clean_qa_status(qa_status)
+
+        row_values = [
+            r1_url, r1_title, r2_url, r2_title,
+            best_url, score_str, classification, search_method,
+            qa_clean, redirect_url,
+        ]
         batch_buffer.append({"row": sheet_row, "values": row_values})
         processed += 1
 
