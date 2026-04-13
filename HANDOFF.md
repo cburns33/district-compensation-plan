@@ -16,9 +16,9 @@ Three parallel tracks:
 2. **Phase 2 (DESIGNED, NOT BUILT)** — Parse the found documents to extract
    salary anchor points (min, mid, max, BA 0 yrs) into new columns.
 
-3. **PIR Track (IN PROGRESS)** — Send Public Information Requests to ~150 Texas
+3. **PIR Track (IN PROGRESS)** — Send Public Information Requests to 188 Texas
    charter school districts whose salary schedules aren't publicly available
-   online. Currently on the contact-discovery sub-step.
+   online. Emails are sending in daily batches of 40.
 
 ---
 
@@ -29,10 +29,17 @@ Three parallel tracks:
 SERPER_API_KEY=...
 GOOGLE_SHEETS_CREDS_JSON=district-compensation-search-e9f9f750566f.json
 SPREADSHEET_ID=...
+GMAIL_CREDENTIALS_JSON=gmail-api.json
+GMAIL_SENDER_EMAIL=chase.burns@talos-advisory.com
+PIR_SENDER_NAME=Chase Burns
 ```
 
-Service account JSON file also lives in the project root. The Google Sheet must
-have the service account email added as **Editor**.
+Two JSON credential files in project root (never committed):
+- `district-compensation-search-*.json` — Google service account (Sheets access)
+- `gmail-api.json` — Gmail OAuth Desktop client
+- `token.json` — saved Gmail OAuth token (auto-generated on first run)
+
+The Google Sheet must have the service account email added as **Editor**.
 
 ```bash
 pip install -r requirements.txt
@@ -46,13 +53,16 @@ pip install -r requirements.txt
 district-compensation-plan/
 ├── search_urls.py          # Phase 1: URL search (COMPLETE — do not re-run full)
 ├── remediate.py            # Phase 1: targeted fix for failed rows (run once, done)
-├── find_pio_contacts.py    # PIR Track: PIO email discovery (IN PROGRESS)
+├── find_pio_contacts.py    # PIR Track: PIO email discovery (COMPLETE)
+├── send_pir.py             # PIR Track: send PIR emails (IN PROGRESS — batches running)
 ├── requirements.txt
 ├── HANDOFF.md              # This file
 ├── .gitignore
 ├── .env                    # Not committed
 ├── district-compensation-search-*.json  # Not committed
-└── logs/                   # Timestamped run logs (not committed)
+├── gmail-api.json          # Not committed
+├── token.json              # Not committed (auto-generated)
+└── logs/                   # Timestamped run logs + empty_run_count.txt (not committed)
 ```
 
 `migrate_columns.py` also exists — a one-time migration script that was never
@@ -126,112 +136,117 @@ Scripts write **only columns F–O (indices 6–15)**. Column guard enforced in 
 
 ### Background
 
-~150 Texas charter school districts don't publish salary schedules online.
+188 Texas charter school districts don't publish salary schedules online.
 Under Tex. Educ. Code § 12.1051 and Texas Government Code Chapter 552 (TPIA),
 charter schools are subject to public information requests. Salary schedules are
 mandatory disclosure under § 552.022(a)(2).
 
-The plan is to email each district's Officer for Public Information (PIO) with a
-formal PIR, then manually log responses into the sheet.
+Contact emails were sourced from AskTED (TEA's role-based contact database),
+prioritized in this order: HR > CFO > Secretary to Supt > Asst/Assoc/Deputy Supt
+> PEIMS Coordinator > School Email (Directory) > Manual.
 
 ### Google Sheet: "PIR_Tracking" tab
 
-Pre-populated columns (do not write to these):
-- **A** — District_Number (primary key)
-- **B** — District_Name
-- **C** — District_Web_Address
-- **F** — Date_Sent (written by send_pir.py, not yet built)
-- **H** — Response_URL (manual entry)
+| Col | Header | Source |
+|-----|--------|--------|
+| A | District_Number | Pre-populated — read only |
+| B | District_Name | Pre-populated — read only |
+| C | District_Web_Address | Pre-populated — read only |
+| D | PIO_Email | Imported from AskTED; updated manually for corrections |
+| E | Email_Role | Imported from AskTED (e.g. "Human Resources") — read only |
+| F | PIO_Source | Written by find_pio_contacts.py |
+| G | Date_Sent | Written by send_pir.py (`YYYY-MM-DD HH:MM:SS`) |
+| H | Status | Written by find_pio_contacts.py (`PIO_FOUND` / `PIO_NOT_FOUND`) |
+| I | Response_URL | Manual entry — never written by scripts |
+| J | Notes | Written by find_pio_contacts.py |
+| K | Full_Name | Contact full name — read only |
+| L | First_Name | Contact first name — read only |
+| M | Last_Name | Contact last name — read only |
+| N | Send_Status | Written by send_pir.py (`Sent`, `Sent (grouped: N)`, `Failed: ...`) |
 
-Written by `find_pio_contacts.py`:
-- **D** — PIO_Email
-- **E** — PIO_Source (e.g. `serper:https://...` or `crawl:https://...`)
-- **G** — Status (`PIO_FOUND` or `PIO_NOT_FOUND`)
-- **I** — Notes
+find_pio_contacts.py write guard: cols D, F, H, J only.
+send_pir.py write guard: cols G, N only.
 
-Script enforces a write-column safety guard — only cols 4, 5, 7, 9 (D, E, G, I).
+### Current PIR Send Progress (as of 2026-04-13)
 
-### find_pio_contacts.py — Current State
+- **Total districts:** 188 across 172 email groups (8 groups cover multiple districts)
+- **Batch 1 sent:** 40 groups (42 districts) on 2026-04-13
+- **Remaining:** 132 groups
+- **Daily schedule:** 40 groups/day at 9:05 AM via Claude scheduled task `pir-daily-send`
+- **Estimated completion:** ~4 more days
 
-**Purpose:** Discover the PIO email for each charter district.
+Manual corrections made to batch 1:
+- **ACCELERATED INTERMEDIATE ACADEMY** — original aol.com address was dead; resent to `aiapeims2020b@aol.com` (district-provided)
+- **BASIS TEXAS** — original `andrea.treesler@basised.com` was dead; resent to `ANDREW.FREEMAN@BTXSCHOOLS.ORG` (CFO, from AskTED backup)
+- **WINFREE ACADEMY CHARTER SCHOOLS** — district redirected to `dstaples@wacsd.com`; resent with corrected contact name (Deirdre Staples)
+- **UT TYLER UNIVERSITY ACADEMY** — district uses a web portal for PIR submissions; submitted manually; Send_Status set to "Submitted via portal"
 
-**Pipeline per district:**
+### find_pio_contacts.py — COMPLETE
 
-1. **Stage 1 (Serper, 1 credit):** Query
-   `"{District Name}" Texas "public information request" OR "public information officer"`
-   Fetch top result pages and extract email. Only accepts emails that are on the
-   district's own domain (verified via `domain_hint` scoring). Off-domain emails
-   are rejected regardless of PIO keyword context.
+Email discovery is done. All 188 rows have a PIO_Email populated from AskTED.
+Do not re-run this script unless a new district is added to PIR_Tracking.
 
-2. **Stage 2 (homepage crawl, 0 credits):** Try common PIO paths on the
-   district's own website (`/public-information`, `/open-records`, `/contact`,
-   etc.). Same domain-hint scoring applies.
-
-3. **Stage 3:** Flag `PIO_NOT_FOUND` and write to Notes for manual follow-up.
-   No superintendent email fallback.
-
-**Key design decisions:**
-- Emails on `*.state.tx.us` and `*.texas.gov` are rejected (state agencies are
-  never a charter school's PIO contact).
-- Snippet emails: only accepted if on the district's own domain (PIO keyword
-  proximity alone is insufficient — TEA's own PIR page would otherwise match).
-- Page-fetch emails: require `min_score=3` (must be on district domain). Off-domain
-  emails near PIO keywords score 2 and are filtered out.
-- Without a district web address in col C, page fetches are skipped entirely
-  (no way to verify email belongs to the district).
-- Binary/PDF responses from Serper are handled: `fetch_page` checks Content-Type
-  and skips non-HTML. BeautifulSoup parse errors are caught and return `[]`.
-
-**Commands:**
+**Commands (for reference):**
 ```bash
 # Validate logic against 4 known charters (no sheet access, uses Serper)
 python find_pio_contacts.py --test
 
-# Full run (resumes — skips rows with existing Status)
-python find_pio_contacts.py
-
-# First N districts only
-python find_pio_contacts.py --limit 50
-
 # Single district by District_Number
 python find_pio_contacts.py --district-number 057829
 
-# Re-process already-written rows (overwrites)
-python find_pio_contacts.py --limit 10 --force
+# Re-process a row (overwrites)
+python find_pio_contacts.py --district-number 057829 --force
 
 # Preview without API or sheet writes
 python find_pio_contacts.py --dry-run
 ```
 
-**Current progress:**
-- First 10 rows of PIR_Tracking have been processed.
-- Results written to sheet. 4/10 found, 6/10 NOT_FOUND.
-- `--test` mode passes 4/4 known charters.
-- Full batch (~140 remaining) has not been run yet.
+### send_pir.py — IN PROGRESS (batches sending daily)
 
-**Expected accuracy:** ~65–75% PIO_FOUND across all 150 districts based on test
-results. NOT_FOUND rows will need manual follow-up.
+Sends TPIA-compliant PIR emails via Gmail API. Districts that share the same
+PIO email address receive a single grouped email listing all districts — legally
+equivalent to separate PIRs, avoids near-identical duplicates in the same inbox.
 
-### send_pir.py — Not Built Yet
+**Commands:**
+```bash
+# Show grouping table (who shares an address) — no sends
+python send_pir.py --groups
 
-The next script after PIO discovery is complete. Will:
-1. Read PIO_FOUND rows from PIR_Tracking
-2. Draft a TPIA-compliant PIR email per district
-3. Send via Gmail API (OAuth 2.0 desktop flow)
-4. Write Date_Sent to col F
+# Preview emails — no sends, no sheet writes
+python send_pir.py --dry-run
 
-Gmail API deps not yet installed. Will need:
+# Send next batch (capped at 40 groups — runs automatically via scheduler)
+python send_pir.py
+
+# Send first N groups only
+python send_pir.py --limit 5
+
+# Correct a contact and resend in one atomic operation
+python send_pir.py --district-number 57828 \
+  --update email=dstaples@wacsd.com full_name="Deirdre Staples" first_name=Deirdre last_name=Staples \
+  --force
 ```
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
-```
 
-Sample PIR text (from prior research):
-> Pursuant to the Texas Public Information Act, Texas Government Code Chapter 552,
-> I am requesting a copy of [District Name]'s current teacher/staff salary schedule
-> or compensation plan, including all pay grades, steps, and applicable stipends.
-> Please provide the record in electronic format if available.
+**IMPORTANT — correcting a contact email:**
+Always use `--update` rather than editing the sheet manually. It enforces that
+email and name fields are updated together. The script blocks an email-only
+update with no name fields — this prevents stale salutations going out to the
+wrong person's name.
+
+**Salutation logic (in order of priority):**
+1. First + Last name in cols L/M → `Dear Jana Coulter,`
+2. First name only → `Dear Jana,`
+3. No name, known role → role display name (e.g. `Dear Human Resources Director,`)
+4. Fallback → `Dear Public Information Officer,`
+
+"School Email (Directory)" and "Manual" never appear verbatim in email text.
+
+**Scheduled task:** `pir-daily-send` runs at 9:05 AM daily via Claude Code
+scheduler. Auto-disables after 3 consecutive empty runs. Monitor from the
+Scheduled section in the Claude Code sidebar.
+
+**Rate limit:** 40 email groups per run, 2s delay between sends.
+Sending from `chase.burns@talos-advisory.com` (Google Workspace, talos-advisory.com).
 
 ---
 
@@ -266,15 +281,18 @@ Extraction approach by format:
   allowed range raises a `RuntimeError` and halts.
 - **Windows UTF-8**: all scripts have a stdout/stderr wrapper to handle
   Unicode symbols (✓, ⚠, ✗) on Windows cp1252 consoles.
+- **Correcting a sent email:** use `send_pir.py --update ... --force`, never
+  edit the sheet directly. The guard requires name fields alongside any email
+  change to prevent stale salutations.
 
 ---
 
 ## Known Issues / Limitations
 
-- **No web address in PIR_Tracking col C**: some charter districts have blank
-  web addresses. These skip Stage 1 page fetches and rely on Stage 2, which also
-  produces nothing. Likely NOT_FOUND — manual lookup needed.
+- **UT Tyler University Academy** uses a web portal for PIR submissions rather
+  than a direct email address. Any future charter school that responds similarly
+  should have its Send_Status set to "Submitted via portal" manually.
 - **JS-routed pages**: some district sites use React/Next.js routing and return
   blank HTML to the requests library. Stage 2 crawl misses emails on these.
-- **Generic addresses (info@, contact@)**: these are valid PIR recipients and
-  are accepted if on the district's own domain. Not filtered out.
+- **Generic addresses (info@, contact@)**: valid PIR recipients if on the
+  district's own domain. Not filtered out.

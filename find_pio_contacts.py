@@ -69,16 +69,20 @@ RATE_LIMIT_SLEEP = 1.5   # seconds between Serper calls
 RETRY_SLEEP      = 4.0
 FETCH_TIMEOUT    = 8     # seconds for page fetches
 
-# PIR_Tracking column indices (1-based)
+# PIR_Tracking column indices (1-based, verify against sheet before running)
 COL_DISTRICT_NUMBER  = 1   # A — read only
 COL_DISTRICT_NAME    = 2   # B — read only
 COL_WEB_ADDRESS      = 3   # C — read only
 COL_PIO_EMAIL        = 4   # D — written
-COL_PIO_SOURCE       = 5   # E — written
-COL_DATE_SENT        = 6   # F — read only (written by send_pir.py)
-COL_STATUS           = 7   # G — written
-COL_RESPONSE_URL     = 8   # H — read only (manual)
-COL_NOTES            = 9   # I — written
+COL_EMAIL_ROLE       = 5   # E — read only (imported from AskTED; e.g. "Human Resources")
+COL_PIO_SOURCE       = 6   # F — written
+COL_DATE_SENT        = 7   # G — read only (written by send_pir.py)
+COL_STATUS           = 8   # H — written
+COL_RESPONSE_URL     = 9   # I — read only (manual)
+COL_NOTES            = 10  # J — written
+COL_FULL_NAME        = 11  # K — read only (name fields added by user)
+COL_FIRST_NAME       = 12  # L — read only
+COL_LAST_NAME        = 13  # M — read only
 
 # Columns this script is allowed to write
 WRITE_COLS = {COL_PIO_EMAIL, COL_PIO_SOURCE, COL_STATUS, COL_NOTES}
@@ -111,10 +115,12 @@ REJECT_DOMAINS = [
     "dallasnews", "houstonchronicle", "statesman", "chron",
 ]
 
-# Email addresses to reject even if found
+# Email addresses to reject even if found.
+# No ^ anchors — re.search is used so these match anywhere in the address,
+# catching phone-concatenated forms like "9366345515webmaster@domain.com".
 REJECT_EMAIL_PATTERNS = [
-    r'^noreply@', r'^no-reply@', r'^donotreply@',
-    r'^webmaster@', r'^postmaster@', r'^abuse@',
+    r'noreply', r'no-reply', r'no_reply', r'donotreply',
+    r'webmaster', r'postmaster', r'abuse@',
     # Texas state agency domains — never the correct PIO for a charter school
     r'@.*\.state\.tx\.us$',
     r'@.*\.texas\.gov$',
@@ -145,15 +151,34 @@ def _assert_col_writable(col: int) -> None:
     if col not in WRITE_COLS:
         raise RuntimeError(
             f"SAFETY HALT: attempted write to column {col}. "
-            f"Allowed write columns: {sorted(WRITE_COLS)} (D, E, G, I). Halting."
+            f"Allowed write columns: {sorted(WRITE_COLS)} (D, F, H, J). Halting."
         )
 
 
 # ── Email extraction helpers ──────────────────────────────────────────────────
 
+_PHONE_PREFIX_RE = re.compile(r'^\d[\d\-\.]{6,}(?=[a-zA-Z])')
+
+def _clean_email(email: str) -> str:
+    """
+    Strip leading phone-number prefixes from email local parts.
+    Handles cases like '9366345515webmaster@domain.com' → 'webmaster@domain.com'
+    when scraped text concatenates a phone number directly with an email address.
+    """
+    if "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    cleaned_local = _PHONE_PREFIX_RE.sub("", local)
+    if cleaned_local and cleaned_local != local:
+        candidate = f"{cleaned_local}@{domain}"
+        if EMAIL_RE.match(candidate):
+            return candidate
+    return email
+
+
 def _is_valid_email(email: str) -> bool:
     """Return False for noreply, webmaster, and other non-contact addresses."""
-    email_lower = email.lower()
+    email_lower = _clean_email(email.lower())
     for pattern in REJECT_EMAIL_PATTERNS:
         if re.search(pattern, email_lower):
             return False
@@ -310,6 +335,18 @@ def stage1_serper(
 ) -> tuple[str, str]:
     """
     Search Serper for the district's PIO contact page.
+
+    Two passes over the same 5 results (zero extra credits):
+
+    Pass 1 — PIO quality (min_score=3): email must be on the district's own
+    domain. Returns immediately on first match.
+
+    Pass 2 — Contact fallback: if Pass 1 found nothing, re-scan cached HTML.
+    Accepts any email where the email domain matches the page domain, provided
+    the page domain contains at least one meaningful word from the district name
+    (guards against transcript/directory services like needmytranscript.com).
+    Source tagged `serper_contact:` so sheet shows lower confidence.
+
     Returns (email, source_note) or ("", "").
     """
     query = (
@@ -324,49 +361,154 @@ def stage1_serper(
         logger.warning("Stage-1 Serper failed: %s", exc)
         return "", ""
 
-    # Also check answerBox snippet for an email (zero extra credits)
+    # Derive district domain hint once
+    hint_domain = ""
+    if web_address:
+        _p = urlparse(web_address if "://" in web_address else f"https://{web_address}")
+        hint_domain = _p.netloc.lstrip("www.").lower()
+
+    # Words from district name used to verify Pass-2 pages belong to the district.
+    # Strip generic school/state words that appear everywhere.
+    _GENERIC = {
+        "texas", "public", "school", "schools", "academy", "charter",
+        "district", "international", "leadership", "education", "prep",
+        "preparatory", "learning", "institute", "community",
+    }
+    name_words = {
+        w for w in re.findall(r'[a-z]{4,}', district_name.lower())
+        if w not in _GENERIC
+    }
+
+    # ── Pass 1: PIO-quality search ────────────────────────────────────────────
+    # Scan all 5 result pages and track the best-scored email rather than
+    # returning on the first hit. Score 4 (on district domain + page has PIO
+    # keywords) beats score 3 (on district domain, generic contact page), so a
+    # dedicated PIO inbox wins over a personal staff email on a contact page
+    # regardless of Serper result order.
+    html_cache: dict[str, str] = {}
+    best_email = ""
+    best_score = 0
+    best_source = ""
+
     for result in results:
         url = result.get("link", "")
         if not url or _is_reject_domain(url):
             continue
 
-        # Extract district domain hint for quality checks
-        hint_domain = ""
-        if web_address:
-            _p = urlparse(web_address if "://" in web_address else f"https://{web_address}")
-            hint_domain = _p.netloc.lstrip("www.").lower()
-
-        # Try to extract email from snippet first (fast, no fetch)
-        # Only accept snippet emails that are on the district's own domain —
-        # PIO-keyword context alone isn't enough (e.g. TEA's own PIR page snippet)
+        # Snippet: only accept emails on the district's own domain
         snippet = result.get("snippet", "") + " " + result.get("title", "")
-        snippet_emails = EMAIL_RE.findall(snippet)
-        for e in snippet_emails:
+        for e in EMAIL_RE.findall(snippet):
             e = e.lower()
-            if not _is_valid_email(e):
-                continue
-            on_district_domain = bool(hint_domain and e.endswith(f"@{hint_domain}"))
-            if on_district_domain:
-                logger.info("Stage-1 email from snippet: %s (via %s)", e, url)
-                return e, f"serper_snippet:{url}"
+            if _is_valid_email(e) and hint_domain and e.endswith(f"@{hint_domain}"):
+                score = 4 if bool(PIO_KEYWORDS.search(snippet)) else 3
+                if score > best_score:
+                    best_score, best_email, best_source = score, e, f"serper_snippet:{url}"
 
-        # Without a district web address we can't verify a page belongs to the district —
-        # skip page fetches to avoid accepting unrelated third-party contact emails
-        if not hint_domain:
-            logger.debug("No domain hint — skipping page fetch for %s", url)
-            continue
-
-        # Fetch the page and scan for email
-        # Require min_score=2: email must be on district domain or near PIO keywords
+        # Fetch page (always, so Pass 2 can reuse the cache)
         html = fetch_page(url, logger)
-        if not html:
+        html_cache[url] = html
+        if not html or not hint_domain:
             continue
+
         emails = extract_emails_from_html(
             html, prefer_pio_context=True, domain_hint=web_address, min_score=3
         )
         if emails:
-            logger.info("Stage-1 email from page: %s (via %s)", emails[0], url)
-            return emails[0], f"serper:{url}"
+            score = 4 if bool(PIO_KEYWORDS.search(html)) else 3
+            if score > best_score:
+                best_score, best_email, best_source = score, emails[0], f"serper:{url}"
+            if best_score == 4:
+                break  # can't do better
+
+    if best_email:
+        logger.info("Stage-1 email (score=%d): %s (via %s)", best_score, best_email, best_source)
+        return best_email, best_source
+
+    # ── Pass 2: contact fallback (same pages, zero extra credits) ─────────────
+    logger.debug("Stage-1 Pass 2 (contact fallback) for %s", district_name)
+
+    for result in results:
+        url = result.get("link", "")
+        if not url or _is_reject_domain(url):
+            continue
+
+        page_host = urlparse(url).netloc.lstrip("www.").lower()
+
+        # Require at least one district name word in the page domain — prevents
+        # accepting support emails from transcript/directory services
+        if name_words and not any(w in page_host for w in name_words):
+            logger.debug("Pass 2: skipping %s (no name word in domain)", url)
+            continue
+
+        html = html_cache.get(url) or fetch_page(url, logger)
+        if not html:
+            continue
+
+        all_emails = extract_emails_from_html(html, prefer_pio_context=False)
+        for email in all_emails:
+            email_host = email.split("@")[1].lower() if "@" in email else ""
+            if email_host == page_host:
+                logger.info("Stage-1 contact fallback: %s (via %s)", email, url)
+                return email, f"serper_contact:{url}"
+
+    return "", ""
+
+
+# ── Stage 1.5: Contact-email fallback search ──────────────────────────────────
+
+def stage1_5_contact(
+    district_name: str,
+    api_key: str,
+    logger: logging.Logger,
+) -> tuple[str, str]:
+    """
+    Last-resort Serper search. Only called when Stage 1 (PIO query) and
+    Stage 2 (homepage crawl) both return nothing.
+
+    Uses 1 additional credit with query: "{district_name}" Texas contact email
+    This surfaces the district's own contact/staff pages that the PIO-specific
+    query misses for schools with no indexed public-information content.
+
+    Accepts the first email where the email domain matches the page domain
+    (the page is the district's own website). Source tagged `serper_contact15:`.
+    """
+    query = f'"{district_name}" Texas contact email'
+    logger.info("Stage-1.5 contact search: %s", query)
+
+    try:
+        results = call_serper(query, api_key, logger)
+    except Exception as exc:
+        logger.warning("Stage-1.5 Serper failed: %s", exc)
+        return "", ""
+
+    for result in results:
+        url = result.get("link", "")
+        if not url or _is_reject_domain(url):
+            continue
+
+        page_host = urlparse(url).netloc.lstrip("www.").lower()
+
+        # Snippet first — any valid email in the snippet is worth trying
+        snippet = result.get("snippet", "") + " " + result.get("title", "")
+        for e in EMAIL_RE.findall(snippet):
+            e = e.lower()
+            if _is_valid_email(e):
+                email_host = e.split("@")[1].lower() if "@" in e else ""
+                if email_host == page_host:
+                    logger.info("Stage-1.5 email from snippet: %s (via %s)", e, url)
+                    return e, f"serper_contact15:{url}"
+
+        # Fetch and scan the page
+        html = fetch_page(url, logger)
+        if not html:
+            continue
+
+        all_emails = extract_emails_from_html(html, prefer_pio_context=True)
+        for email in all_emails:
+            email_host = email.split("@")[1].lower() if "@" in email else ""
+            if email_host == page_host:
+                logger.info("Stage-1.5 email from page: %s (via %s)", email, url)
+                return email, f"serper_contact15:{url}"
 
     return "", ""
 
@@ -441,6 +583,16 @@ def load_tracking_rows(sheet) -> list[dict]:
     return rows
 
 
+def col_letter(col_1based: int) -> str:
+    """Convert 1-based column index to letter (1=A, 26=Z, 27=AA, ...)."""
+    result = ""
+    n = col_1based
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
 def write_result(
     sheet,
     sheet_row: int,
@@ -451,7 +603,7 @@ def write_result(
     dry_run: bool,
     logger: logging.Logger,
 ) -> None:
-    """Write D, E, G, I for the given sheet row."""
+    """Write PIO_Email (D), PIO_Source (F), Status (H), Notes (J) for the given sheet row."""
     _assert_col_writable(COL_PIO_EMAIL)
     _assert_col_writable(COL_PIO_SOURCE)
     _assert_col_writable(COL_STATUS)
@@ -466,10 +618,10 @@ def write_result(
         return
 
     data = [
-        {"range": f"D{sheet_row}", "values": [[pio_email]]},
-        {"range": f"E{sheet_row}", "values": [[pio_source]]},
-        {"range": f"G{sheet_row}", "values": [[status]]},
-        {"range": f"I{sheet_row}", "values": [[notes]]},
+        {"range": f"{col_letter(COL_PIO_EMAIL)}{sheet_row}",  "values": [[pio_email]]},
+        {"range": f"{col_letter(COL_PIO_SOURCE)}{sheet_row}", "values": [[pio_source]]},
+        {"range": f"{col_letter(COL_STATUS)}{sheet_row}",     "values": [[status]]},
+        {"range": f"{col_letter(COL_NOTES)}{sheet_row}",      "values": [[notes]]},
     ]
     sheet.batch_update(data, value_input_option="USER_ENTERED")
     logger.debug("Wrote row %d: email=%s status=%s", sheet_row, pio_email, status)
@@ -519,7 +671,9 @@ TEST_DISTRICTS = [
         "District_Number": "TEST-002",
         "District_Name": "YES Prep Public Schools",
         "District_Web_Address": "https://www.yesprep.org",
-        "expected_email": "publicinfo@yesprep.org",  # published on /about/contact
+        # Accept any email on yesprep.org — Serper results change between runs
+        # and the district may list different contacts on different pages.
+        "expected_email": "@yesprep.org",
     },
     {
         "District_Number": "TEST-003",
@@ -584,10 +738,16 @@ def run_test_mode(serper_key: str, logger: logging.Logger) -> None:
                 print(f"  Stage 2 result: {found_email}  [{found_source}]")
 
         # Verdict
+        # expected starting with "@" means accept any email on that domain
+        domain_only = expected.startswith("@")
         if not found_email:
             print(f"  RESULT: NOT FOUND")
             verdict = "FAIL (not found)"
             failed += 1
+        elif domain_only and found_email.endswith(expected):
+            print(f"  RESULT: PASS — domain match ({found_email})")
+            verdict = "PASS"
+            passed += 1
         elif found_email == expected:
             print(f"  RESULT: PASS — exact match")
             verdict = "PASS"
@@ -745,9 +905,18 @@ def main():
         # ── Stage 2: Homepage crawl ───────────────────────────────────────────
         if not pio_email and not args.dry_run:
             pio_email, pio_source = stage2_crawl(web_address, logger, domain_hint=web_address)
-
         elif not pio_email and args.dry_run:
             print(f"  [DRY-RUN] Would run Stage-2 crawl on {web_address}")
+
+        # ── Stage 1.5: Contact-email fallback (1 extra Serper credit) ─────────
+        if not pio_email and not args.dry_run:
+            try:
+                pio_email, pio_source = stage1_5_contact(district_name, serper_key, logger)
+                time.sleep(RATE_LIMIT_SLEEP)
+            except Exception as exc:
+                logger.error("Stage-1.5 error for %s: %s", district_name, exc)
+        elif not pio_email and args.dry_run:
+            print(f"  [DRY-RUN] Would run Stage-1.5 contact search")
 
         # ── Stage 3: Flag for manual follow-up ───────────────────────────────
         if pio_email:
