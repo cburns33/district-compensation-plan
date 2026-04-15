@@ -282,12 +282,19 @@ Respectfully,
 
 
 def _wrap_html(plain_body: str) -> str:
+    """Convert plain text body to HTML. Double newlines become paragraphs;
+    single newlines become <br>. Uses a proportional font and natural line
+    wrapping instead of a <pre> block so the email renders at full width."""
+    paragraphs = plain_body.split("\n\n")
+    html_paras = "".join(
+        f"<p>{para.replace(chr(10), '<br>')}</p>"
+        for para in paragraphs
+    )
     return (
         "<html><body>"
-        '<pre style="white-space:pre-wrap; font-family:Arial, sans-serif; '
-        'font-size:14px; line-height:1.5">'
-        f"{plain_body}"
-        "</pre></body></html>"
+        '<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px">'
+        f"{html_paras}"
+        "</div></body></html>"
     )
 
 

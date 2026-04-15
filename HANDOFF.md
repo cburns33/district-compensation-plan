@@ -13,12 +13,19 @@ Three parallel tracks:
    school district compensation plan URLs. Score, QA-check, and write results to
    the **Unique Districts** tab of a Google Sheet.
 
-2. **Phase 2 (DESIGNED, NOT BUILT)** — Parse the found documents to extract
-   salary anchor points (min, mid, max, BA 0 yrs) into new columns.
+2. **Phase 2 (IN DESIGN)** — Extract full step/lane salary matrices from found
+   documents into a normalized database. Target output feeds two products:
+   - **Product 1:** Teacher compensation dashboard (base + TIA allotment by
+     experience/degree/designation at any TX district)
+   - **Product 2:** Intervention benefit-cost analysis engine (shadow-prices
+     staff costs using salary schedules; designed to interoperate with district
+     data via Ed-Fi data standards)
+   Database: SQLite during build, Postgres at deployment. Schema to follow
+   Ed-Fi standards from the start. Pilot will use PIR response documents.
 
-3. **PIR Track (IN PROGRESS)** — Send Public Information Requests to 188 Texas
-   charter school districts whose salary schedules aren't publicly available
-   online. Emails are sending in daily batches of 40.
+3. **PIR Track (IN PROGRESS)** — Send Public Information Requests to 196 Texas
+   school districts (188 charters + 8 non-charter ISDs) whose salary schedules
+   aren't publicly available online. Emails sending in daily batches of 40.
 
 ---
 
@@ -37,7 +44,8 @@ PIR_SENDER_NAME=Chase Burns
 Two JSON credential files in project root (never committed):
 - `district-compensation-search-*.json` — Google service account (Sheets access)
 - `gmail-api.json` — Gmail OAuth Desktop client
-- `token.json` — saved Gmail OAuth token (auto-generated on first run)
+- `token.json` — saved Gmail OAuth token for send_pir.py (gmail.send scope)
+- `token_reader.json` — saved Gmail OAuth token for check_pir_responses.py (gmail.readonly + gmail.send)
 
 The Google Sheet must have the service account email added as **Editor**.
 
@@ -51,18 +59,20 @@ pip install -r requirements.txt
 
 ```
 district-compensation-plan/
-├── search_urls.py          # Phase 1: URL search (COMPLETE — do not re-run full)
-├── remediate.py            # Phase 1: targeted fix for failed rows (run once, done)
-├── find_pio_contacts.py    # PIR Track: PIO email discovery (COMPLETE)
-├── send_pir.py             # PIR Track: send PIR emails (IN PROGRESS — batches running)
+├── search_urls.py              # Phase 1: URL search (COMPLETE — do not re-run full)
+├── remediate.py                # Phase 1: targeted fix for failed rows (run once, done)
+├── find_pio_contacts.py        # PIR Track: PIO email discovery (COMPLETE)
+├── send_pir.py                 # PIR Track: send PIR emails (IN PROGRESS — batches running)
+├── check_pir_responses.py      # PIR Track: scan Gmail for replies, update sheet, print report
 ├── requirements.txt
-├── HANDOFF.md              # This file
+├── HANDOFF.md                  # This file
 ├── .gitignore
-├── .env                    # Not committed
+├── .env                        # Not committed
 ├── district-compensation-search-*.json  # Not committed
-├── gmail-api.json          # Not committed
-├── token.json              # Not committed (auto-generated)
-└── logs/                   # Timestamped run logs + empty_run_count.txt (not committed)
+├── gmail-api.json              # Not committed
+├── token.json                  # Not committed (send_pir.py OAuth token, gmail.send)
+├── token_reader.json           # Not committed (check_pir_responses.py OAuth token, gmail.readonly+send)
+└── logs/                       # Timestamped run logs + empty_run_count.txt (not committed)
 ```
 
 `migrate_columns.py` also exists — a one-time migration script that was never
@@ -163,23 +173,39 @@ prioritized in this order: HR > CFO > Secretary to Supt > Asst/Assoc/Deputy Supt
 | L | First_Name | Contact first name — read only |
 | M | Last_Name | Contact last name — read only |
 | N | Send_Status | Written by send_pir.py (`Sent`, `Sent (grouped: N)`, `Failed: ...`) |
+| O | Response_Date | Written by check_pir_responses.py (`YYYY-MM-DD`) |
+| P | Response_Status | Written by check_pir_responses.py (`Doc Received`, `URL Received`, `Delay Notice`, `Denial`, `See Portal`, `Responded`) |
+| Q | Followup_Sent | Written by check_pir_responses.py — date follow-up sent (`YYYY-MM-DD`) |
 
 find_pio_contacts.py write guard: cols D, F, H, J only.
 send_pir.py write guard: cols G, N only.
+check_pir_responses.py write guard: cols O, P, Q only.
 
-### Current PIR Send Progress (as of 2026-04-13)
+### Current PIR Send Progress (as of 2026-04-14)
 
-- **Total districts:** 188 across 172 email groups (8 groups cover multiple districts)
-- **Batch 1 sent:** 40 groups (42 districts) on 2026-04-13
-- **Remaining:** 132 groups
+- **Total districts:** 196 (188 original charters + 8 non-charter ISDs added manually)
+- **Batch 1 sent:** 40 groups on 2026-04-13
+- **Batch 2 sent:** 40 groups on 2026-04-14 (run manually — scheduled task stalled, see below)
+- **Remaining:** ~100 groups
 - **Daily schedule:** 40 groups/day at 9:05 AM via Claude scheduled task `pir-daily-send`
-- **Estimated completion:** ~4 more days
+- **KNOWN ISSUE:** Scheduled task requires Bash tool pre-approval. Click "Run now" from
+  the Scheduled section in the Claude Code sidebar once to approve — then it runs unattended.
 
-Manual corrections made to batch 1:
-- **ACCELERATED INTERMEDIATE ACADEMY** — original aol.com address was dead; resent to `aiapeims2020b@aol.com` (district-provided)
-- **BASIS TEXAS** — original `andrea.treesler@basised.com` was dead; resent to `ANDREW.FREEMAN@BTXSCHOOLS.ORG` (CFO, from AskTED backup)
-- **WINFREE ACADEMY CHARTER SCHOOLS** — district redirected to `dstaples@wacsd.com`; resent with corrected contact name (Deirdre Staples)
-- **UT TYLER UNIVERSITY ACADEMY** — district uses a web portal for PIR submissions; submitted manually; Send_Status set to "Submitted via portal"
+**8 non-charter ISDs added to PIR_Tracking (Status=PIO_FOUND, PIO_Source=Manual):**
+Claude ISD, Pettus ISD, Panther Creek CISD, Seminole ISD, McLean ISD, North Hopkins ISD,
+Coolidge ISD, Munday CISD (Munday has blank name fields — email/name mismatch in source data;
+defaults to role-based salutation).
+
+**All corrections to date:**
+- **ACCELERATED INTERMEDIATE ACADEMY** — resent to `aiapeims2020b@aol.com` (district-provided)
+- **BASIS TEXAS** — resent to `ANDREW.FREEMAN@BTXSCHOOLS.ORG` (CFO, AskTED backup)
+- **WINFREE ACADEMY CHARTER SCHOOLS** — resent to `dstaples@wacsd.com` (Deirdre Staples)
+- **UT TYLER UNIVERSITY ACADEMY** — submitted via web portal; Send_Status = "Submitted via portal"
+- **EDUCATION CENTER INTERNATIONAL ACADEMY** — resent to `bdensmore@eciacharter.com` (Bobby Densmore, Asst. Supt.)
+- **RAPOPORT ACADEMY PUBLIC SCHOOL** — original contact no longer employed; resent to `mnelson@rapswaco.org` (Melanie Nelson); wrong Denial status cleared from cols O/P
+- **NOVA ACADEMY** — resent to `admissions.austin@novaacademy.school` (no name; role salutation)
+- **COMPASS ROSE PUBLIC SCHOOLS** — resent to `PublicInfoRequest@compassroseschools.org` (no name; role salutation)
+- **PRELUDE PREPARATORY CHARTER SCHOOL** — resent to `Office@preludeprep.org` (no name; role salutation)
 
 ### find_pio_contacts.py — COMPLETE
 
@@ -248,25 +274,104 @@ Scheduled section in the Claude Code sidebar.
 **Rate limit:** 40 email groups per run, 2s delay between sends.
 Sending from `chase.burns@talos-advisory.com` (Google Workspace, talos-advisory.com).
 
+### check_pir_responses.py — Response tracking
+
+Scans Gmail inbox for replies to PIR emails. Writes Response_Date (col O) and
+Response_Status (col P) to PIR_Tracking. Prints a deadline report.
+
+Uses a separate Gmail OAuth token (`token_reader.json`, `gmail.readonly + gmail.send` scopes)
+so it never interferes with `send_pir.py`'s send token.
+
+**Response status values:** `Doc Received`, `URL Received`, `Delay Notice`, `Denial`, `See Portal`, `Responded`
+
+**Matching priority:** exact PIO_Email match > sender domain match > district name in subject
+
+**Commands:**
+```bash
+# Full run: scan Gmail + update sheet + print report
+python check_pir_responses.py
+
+# Full run + send follow-up emails for Doc Received responses
+python check_pir_responses.py --send-followups
+
+# Scan Gmail + print matches, no sheet writes, no sends
+python check_pir_responses.py --dry-run
+
+# Print deadline report from sheet data only (no Gmail scan)
+python check_pir_responses.py --report
+```
+
+**PIR_Tracking columns added by this script:**
+
+| Col | Header | Contents |
+|-----|--------|----------|
+| O | Response_Date | Date reply received (`YYYY-MM-DD`) |
+| P | Response_Status | `Doc Received`, `Delay Notice`, `Denial`, `See Portal`, `Responded` |
+| Q | Followup_Sent | Date follow-up email sent (`YYYY-MM-DD`), blank if not sent |
+
+**Follow-up email:** Short, informal reply into the original thread. Two variants:
+- `Doc Received` — asks whether the schedule is posted on their website
+- `URL Received` — confirms whether that URL is where they post it annually
+Sent only once per PIO email address. Threads correctly into the original email chain.
+Also searches `label:Done-Attachment` and `label:Done-URL` Gmail labels so archived
+threads are included.
+
+**Deadline report categories:**
+- `OVERDUE` — past 10 business days, no response
+- `APPROACHING` — 8-10 business days, no response
+- `RESPONDED` — any response received, with status and date
+- `PENDING` — sent, within 10 business days (count only)
+
 ---
 
-## Phase 2 — Salary Extraction (NOT BUILT)
+## Phase 2 — Salary Extraction (IN DESIGN)
 
-Once Phase 1 URLs are validated, a separate script will:
+### Goal
 
-1. Read Best_URL (col J) and QA_Status (col N) per row
-2. Fetch/parse the document
-3. Extract salary anchor points into new columns (P+):
-   - **Min salary** — 0 yrs experience, lowest credential
-   - **Mid salary** — ~10 yrs experience, BA
-   - **Max salary** — top step, highest credential
-   - **BA 0 yrs** — TEA standard benchmark
+Build a normalized salary database with the full step/lane matrix per district —
+not just anchor points. Each cell: district × school_year × step × lane → dollar amount.
+This is the core data asset for both products.
 
-Extraction approach by format:
-- `✓ PDF` → `pdfplumber` for table detection
-- `✓ XLSX` → `openpyxl` or `pandas`
+### Products this feeds
+
+**Product 1 — Teacher Compensation Dashboard**
+Teacher inputs TIA designation tier, years of experience, degree level, subject/role.
+Gets projected total compensation (base + TIA allotment) at any TX district, current
+year and career projection. No comparable tool exists today.
+
+**Product 2 — Intervention Benefit-Cost Analysis Engine**
+District administrators connect intervention implementation records with shadow-priced
+staff costs (derived from salary schedules) to produce cost-per-outcome efficiency ratios.
+Designed to interoperate with district data via Ed-Fi data standards.
+
+### Database
+
+SQLite during build phase, Postgres at deployment. Schema follows Ed-Fi data standards
+from the start so Product 2 can sync with district data in the Ed-Fi exchange.
+ORM: SQLAlchemy (connection string swap = SQLite → Postgres).
+
+### Extraction pipeline (planned)
+
+**Stage 1 — Format classification**
+Classify each Best_URL as: structured PDF, Excel/CSV, HTML table, or scanned PDF.
+Scanned PDFs require OCR (pytesseract) and are a separate sub-problem.
+
+**Stage 2 — Automated extraction by format**
+- `✓ XLSX` → pandas / openpyxl (cleanest, build first)
+- `✓ PDF` → pdfplumber for table detection
 - `✓ HTML` → BeautifulSoup table scrape
 - JS-rendered → Playwright headless browser fallback
+
+**Stage 3 — Normalization**
+Map heterogeneous lane labels (BA, BS, Column I, Bachelors, Degree 1) to canonical set.
+Map step labels (Year 0, Step 1, 0-1 yrs, Beginning) to integer years.
+Flag unresolved cells for manual review.
+
+### Pilot
+
+Start with PIR response documents (small known set, files in hand, easy to verify
+by eye). Build and validate the extractor and schema on those before scaling to
+Phase 1 URLs.
 
 ---
 
@@ -284,6 +389,9 @@ Extraction approach by format:
 - **Correcting a sent email:** use `send_pir.py --update ... --force`, never
   edit the sheet directly. The guard requires name fields alongside any email
   change to prevent stale salutations.
+- **Email HTML rendering:** both send_pir.py and check_pir_responses.py use
+  `<div>` + `<p>` tags for HTML email bodies (not `<pre>`). This ensures emails
+  render at full width with proportional fonts in all clients.
 
 ---
 
