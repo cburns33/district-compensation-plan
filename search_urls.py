@@ -173,6 +173,17 @@ def score_result(url: str, title: str, snippet: str, homepage_url: str):
             reasons.append(f"-2 news/social penalty ({bad})")
             break
 
+    # -3 wrong-doc penalty — clearly non-salary documents
+    if re.search(
+        r'handbook|board.?trustee|trustee.?handbook|policy.?manual|staff.?handbook'
+        r'|employee.?handbook|improvement.?plan|strategic.?plan|bond.?election'
+        r'|election.?order|annual.?report|financial.?report|budget.?doc|audit.?report'
+        r'|wellness|benefits.?guide|code.?of.?conduct|parent.?guide|student.?handbook',
+        combined, re.IGNORECASE
+    ):
+        score -= 3
+        reasons.append("-3 wrong-doc penalty (handbook/policy/report)")
+
     return score, reasons
 
 
@@ -301,7 +312,7 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
 
 # ── Tier-1.5 year-free fallback search ───────────────────────────────────────
 
-def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger):
+def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger, backend: str = "serper"):
     """
     Fallback query without any year qualifier. Used when the primary
     year-qualified search scores <= FALLBACK_SCORE_THRESHOLD, which happens
@@ -310,7 +321,7 @@ def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger)
     query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan"'
     logger.info("Tier-1.5 year-free fallback: %s", query)
     try:
-        return call_serper(query, api_key, logger)
+        return call_search(query, api_key, backend, logger)
     except Exception as exc:
         logger.warning("Tier-1.5 fallback failed: %s", exc)
         return []
@@ -318,11 +329,11 @@ def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger)
 
 # ── Tier-3 domain-scoped search ───────────────────────────────────────────────
 
-def call_serper_domain(homepage_url: str, api_key: str, logger: logging.Logger):
+def call_serper_domain(homepage_url: str, api_key: str, logger: logging.Logger, backend: str = "serper"):
     """
-    Tier-3: fire a site:-scoped Serper query restricted to the district's own
-    domain. Used when the primary search winner lands on the wrong district's
-    domain. Returns up to 10 results (same format as call_serper).
+    Tier-3: fire a site:-scoped query restricted to the district's own domain.
+    Used when the primary search winner lands on the wrong district's domain.
+    Returns up to 10 results (same format as call_serper).
     """
     domain = tldextract.extract(homepage_url).registered_domain
     if not domain:
@@ -330,10 +341,61 @@ def call_serper_domain(homepage_url: str, api_key: str, logger: logging.Logger):
     query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan"'
     logger.info("Tier-3 domain search: %s", query)
     try:
-        return call_serper(query, api_key, logger)
+        return call_search(query, api_key, backend, logger)
     except Exception as exc:
-        logger.warning("Tier-3 Serper call failed: %s", exc)
+        logger.warning("Tier-3 search failed: %s", exc)
         return []
+
+
+# ── Search API backends ───────────────────────────────────────────────────────
+
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+
+def call_brave(query: str, api_key: str, logger: logging.Logger):
+    """
+    Call Brave Search API and return up to 10 results in the same format
+    as call_serper: list of dicts with keys link, title, snippet.
+    On failure, raises after one retry.
+    """
+    headers_req = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": api_key,
+    }
+    params = {"q": query, "count": 10}
+
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                BRAVE_ENDPOINT,
+                headers=headers_req,
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = []
+            for item in (data.get("web", {}).get("results", []))[:10]:
+                results.append({
+                    "link":    item.get("url", "NO_RESULT"),
+                    "title":   item.get("title", ""),
+                    "snippet": item.get("description", ""),
+                })
+            return results
+        except Exception as exc:
+            logger.warning("Brave attempt %d failed: %s", attempt + 1, exc)
+            if attempt == 0:
+                time.sleep(RETRY_SLEEP)
+            else:
+                raise
+
+
+def call_search(query: str, api_key: str, backend: str, logger: logging.Logger):
+    """Route to Serper or Brave based on backend setting."""
+    if backend == "brave":
+        return call_brave(query, api_key, logger)
+    return call_serper(query, api_key, logger)
 
 
 # ── Serper API ────────────────────────────────────────────────────────────────
@@ -610,6 +672,10 @@ def parse_args():
         "--last-n", type=int, default=None,
         help="Process only the last N data rows (e.g. 10 smallest districts)",
     )
+    parser.add_argument(
+        "--rerun-html", action="store_true",
+        help="Re-search only rows where QA_Status (col N) is '✓ HTML', bypassing resume",
+    )
     return parser.parse_args()
 
 
@@ -663,7 +729,10 @@ def main():
 
     # ── Credentials ───────────────────────────────────────────────────────────
     load_dotenv()
+    search_backend = os.environ.get("SEARCH_BACKEND", "serper").strip().lower()
     serper_key     = os.environ.get("SERPER_API_KEY", "").strip()
+    brave_key      = os.environ.get("BRAVE_API_KEY", "").strip()
+    search_key     = brave_key if search_backend == "brave" else serper_key
     creds_path_raw = os.environ.get("GOOGLE_SHEETS_CREDS_JSON", "").strip()
     # Resolve relative paths from the project directory so .env is portable
     # across machines (Mac, Windows) regardless of absolute folder locations.
@@ -674,7 +743,8 @@ def main():
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
 
     missing = []
-    if not serper_key:     missing.append("SERPER_API_KEY")
+    if search_backend == "brave" and not brave_key: missing.append("BRAVE_API_KEY")
+    if search_backend == "serper" and not serper_key: missing.append("SERPER_API_KEY")
     if not creds_path:     missing.append("GOOGLE_SHEETS_CREDS_JSON")
     if not spreadsheet_id: missing.append("SPREADSHEET_ID")
     if missing:
@@ -721,6 +791,17 @@ def main():
         rows_to_process = list(range(start_row, end_row + 1))
         logger.info("Processing rows %d–%d (%d total)", start_row, end_row, len(rows_to_process))
 
+    # --rerun-html: narrow rows_to_process to only HTML rows
+    if args.rerun_html:
+        html_rows = []
+        for r in rows_to_process:
+            rd = all_values[r - 1]
+            qa = rd[COL_QA_STATUS - 1].strip() if len(rd) >= COL_QA_STATUS else ""
+            if qa == "\u2713 HTML":
+                html_rows.append(r)
+        rows_to_process = html_rows
+        logger.info("--rerun-html: %d HTML rows to re-search", len(rows_to_process))
+
     batch_buffer = []
     start_time   = time.time()
     processed    = 0
@@ -737,8 +818,8 @@ def main():
         homepage_url  = get_col(COL_HOMEPAGE)
         col_f_current = get_col(COL_R1_URL)
 
-        # Resume support
-        if col_f_current:
+        # Resume support — skip if already processed, unless --rerun-html
+        if col_f_current and not args.rerun_html:
             skipped += 1
             logger.debug("Row %d: skipping (Col F already populated: %s)", sheet_row, col_f_current)
             continue
@@ -748,8 +829,18 @@ def main():
             continue
 
         row_start = time.time()
-        query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"'
-        logger.info("Row %d | %s | Query: %s", sheet_row, district_name, query)
+
+        # --rerun-html: try a filetype:pdf query first before the standard query
+        if args.rerun_html:
+            domain = tldextract.extract(homepage_url).registered_domain if homepage_url else ""
+            if domain:
+                query = f'site:{domain} filetype:pdf salary OR compensation 2026 OR "25-26"'
+            else:
+                query = f'"{district_name}" filetype:pdf "salary schedule" OR "compensation plan" 2026'
+            logger.info("Row %d | %s | HTML rerun query: %s", sheet_row, district_name, query)
+        else:
+            query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"'
+            logger.info("Row %d | %s | Query: %s", sheet_row, district_name, query)
 
         # ── Serper call ───────────────────────────────────────────────────────
         r1_url = r2_url = "API_ERROR"
@@ -757,7 +848,7 @@ def main():
         r1_snippet = r2_snippet = ""
 
         try:
-            results = call_serper(query, serper_key, logger)
+            results = call_search(query, search_key, search_backend, logger)
             results = _pad_results(results)
             r1_url, r1_title, r1_snippet = results[0]["link"], results[0]["title"], results[0]["snippet"]
             r2_url, r2_title, r2_snippet = results[1]["link"], results[1]["title"], results[1]["snippet"]
@@ -798,7 +889,7 @@ def main():
                 sheet_row, best_score, FALLBACK_SCORE_THRESHOLD,
             )
             time.sleep(RATE_LIMIT_SLEEP)
-            fb_results = call_serper_noyear(district_name, serper_key, logger)
+            fb_results = call_serper_noyear(district_name, search_key, logger, search_backend)
             fb_results = _pad_results(fb_results)
             for r in fb_results:
                 if r["link"] in ("NO_RESULT", "API_ERROR"):
@@ -834,7 +925,7 @@ def main():
                 "Row %d | Tier-3: domain mismatch (%s ≠ %s), running site search",
                 sheet_row, best_domain, home_domain,
             )
-            t3_results = call_serper_domain(homepage_url, serper_key, logger)
+            t3_results = call_serper_domain(homepage_url, search_key, logger, search_backend)
             t3_results = _pad_results(t3_results)
             t3_scored = []
             for r in t3_results:

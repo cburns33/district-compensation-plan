@@ -61,11 +61,12 @@ COL_DATE_SENT        = 7   # G
 COL_STATUS           = 8   # H  (PIO_FOUND / PIO_NOT_FOUND)
 COL_FIRST_NAME       = 12  # L
 COL_LAST_NAME        = 13  # M
-COL_RESPONSE_DATE    = 15  # O — written by this script
-COL_RESPONSE_STATUS  = 16  # P — written by this script
-COL_FOLLOWUP_SENT    = 17  # Q — written by this script
+COL_RESPONSE_DATE      = 15  # O — written by this script
+COL_RESPONSE_STATUS    = 16  # P — written by this script
+COL_FOLLOWUP_SENT      = 17  # Q — written by this script
+COL_FOLLOWUP_RESPONSE  = 18  # R — written by this script ("Yes" / "No")
 
-WRITE_COLS = {COL_RESPONSE_DATE, COL_RESPONSE_STATUS, COL_FOLLOWUP_SENT}
+WRITE_COLS = {COL_RESPONSE_DATE, COL_RESPONSE_STATUS, COL_FOLLOWUP_SENT, COL_FOLLOWUP_RESPONSE}
 
 # Response classification keywords (checked against lowercased body text)
 PORTAL_KEYWORDS = ["submit online", "online form", "request form", "public portal",
@@ -199,20 +200,21 @@ def load_rows(sheet) -> list[dict]:
     all_values = sheet.get_all_values()
     rows = []
     for i, row in enumerate(all_values[1:], start=2):
-        while len(row) < COL_FOLLOWUP_SENT:
+        while len(row) < COL_FOLLOWUP_RESPONSE:
             row.append("")
         rows.append({
-            "_row":             i,
-            "_district_name":   row[COL_DISTRICT_NAME - 1],
-            "_pio_email":       row[COL_PIO_EMAIL - 1],
-            "_email_role":      row[COL_EMAIL_ROLE - 1],
-            "_date_sent":       row[COL_DATE_SENT - 1],
-            "_pir_status":      row[COL_STATUS - 1],
-            "_first_name":      row[COL_FIRST_NAME - 1],
-            "_last_name":       row[COL_LAST_NAME - 1],
-            "_response_date":   row[COL_RESPONSE_DATE - 1],
-            "_response_status": row[COL_RESPONSE_STATUS - 1],
-            "_followup_sent":   row[COL_FOLLOWUP_SENT - 1],
+            "_row":               i,
+            "_district_name":     row[COL_DISTRICT_NAME - 1],
+            "_pio_email":         row[COL_PIO_EMAIL - 1],
+            "_email_role":        row[COL_EMAIL_ROLE - 1],
+            "_date_sent":         row[COL_DATE_SENT - 1],
+            "_pir_status":        row[COL_STATUS - 1],
+            "_first_name":        row[COL_FIRST_NAME - 1],
+            "_last_name":         row[COL_LAST_NAME - 1],
+            "_response_date":     row[COL_RESPONSE_DATE - 1],
+            "_response_status":   row[COL_RESPONSE_STATUS - 1],
+            "_followup_sent":     row[COL_FOLLOWUP_SENT - 1],
+            "_followup_response": row[COL_FOLLOWUP_RESPONSE - 1],
         })
     return rows
 
@@ -223,9 +225,10 @@ def ensure_response_headers(sheet) -> None:
     while len(header_row) < COL_FOLLOWUP_SENT:
         header_row.append("")
     needed = {
-        COL_RESPONSE_DATE:   "Response_Date",
-        COL_RESPONSE_STATUS: "Response_Status",
-        COL_FOLLOWUP_SENT:   "Followup_Sent",
+        COL_RESPONSE_DATE:     "Response_Date",
+        COL_RESPONSE_STATUS:   "Response_Status",
+        COL_FOLLOWUP_SENT:     "Followup_Sent",
+        COL_FOLLOWUP_RESPONSE: "Followup_Response",
     }
     updates = [
         {"range": f"{col_letter(c)}1", "values": [[h]]}
@@ -263,6 +266,16 @@ def write_followup_sent(sheet, sheet_row: int, date_str: str, dry_run: bool) -> 
     ], value_input_option="USER_ENTERED")
 
 
+def write_followup_response(sheet, sheet_row: int, answer: str, dry_run: bool) -> None:
+    _assert_writable(COL_FOLLOWUP_RESPONSE)
+    if dry_run:
+        print(f"    [DRY-RUN] Row {sheet_row}: Followup_Response={answer!r}")
+        return
+    sheet.batch_update([
+        {"range": f"{col_letter(COL_FOLLOWUP_RESPONSE)}{sheet_row}", "values": [[answer]]},
+    ], value_input_option="USER_ENTERED")
+
+
 # ── Gmail scanning ─────────────────────────────────────────────────────────────
 
 def get_label_id_map(service, names: list[str]) -> dict[str, str]:
@@ -275,9 +288,14 @@ def get_label_id_map(service, names: list[str]) -> dict[str, str]:
 def fetch_replies(service, sender_email: str) -> list[dict]:
     """Fetch inbox messages that look like PIR replies (not from our sender address).
 
-    Also searches Done-Attachment and Done-URL labels so archived threads are included.
+    Also searches all four Done-* labels so archived threads are included.
+    Gmail replaces spaces with hyphens in label search queries.
     """
-    query  = f'((in:inbox subject:"Public Information Request") OR label:Done-Attachment OR label:Done-URL) -from:{sender_email}'
+    query  = (
+        f'((in:inbox subject:"Public Information Request") OR label:Done-Attachment'
+        f' OR label:Done-URL OR label:Done-Follow-Up-Yes OR label:Done-Follow-Up-No)'
+        f' -from:{sender_email}'
+    )
     result = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
     msg_ids = [m["id"] for m in result.get("messages", [])]
     if not msg_ids:
@@ -455,7 +473,7 @@ def send_followup(
         body = (
             f"Hi {greeting},\n\n"
             f"Thanks for pointing me to that link. I appreciate it.\n\n"
-            f"Quick follow-up: is that the standard location where you post {district_ref} each year? "
+            f"Quick follow-up: is that the standard location where you post the salary schedule each year? "
             f"I want to make note of it so I can check there directly in the future.\n\n"
             f"Thanks again,\n\n"
             f"{sender_name}\n"
@@ -464,7 +482,7 @@ def send_followup(
     else:
         body = (
             f"Hi {greeting},\n\n"
-            f"Thanks for sending over {district_ref}. I appreciate the quick turnaround.\n\n"
+            f"Thanks for sending that over. I appreciate the quick turnaround.\n\n"
             f"One quick question: is this information typically posted somewhere on your website? "
             f"I want to make sure I'm not overlooking a public resource for future reference.\n\n"
             f"Thanks again,\n\n"
@@ -524,8 +542,10 @@ def print_report(rows: list[dict]) -> None:
                 pending.append((r, d))
 
     followups_sent    = sum(1 for r in responded if r["_followup_sent"].strip())
-    followups_pending = sum(1 for r in responded if not r["_followup_sent"].strip()
-                           and r["_response_status"] in ("Doc Received", "URL Received"))
+    followups_pending  = sum(1 for r in responded if not r["_followup_sent"].strip()
+                            and r["_response_status"] in ("Doc Received", "URL Received"))
+    fu_yes = sum(1 for r in responded if r["_followup_response"].strip() == "Yes")
+    fu_no  = sum(1 for r in responded if r["_followup_response"].strip() == "No")
 
     print(f"\nPIR Response Report — {format_date()}")
     print("=" * 62)
@@ -552,8 +572,10 @@ def print_report(rows: list[dict]) -> None:
     else:
         print("  None yet")
 
+    if fu_yes or fu_no:
+        print(f"\n  Follow-up responses: {fu_yes} said Yes (public URL exists), {fu_no} said No")
     if followups_pending:
-        print(f"\n  {followups_pending} 'Doc Received' row(s) have no follow-up sent yet.")
+        print(f"\n  {followups_pending} 'Doc Received' / 'URL Received' row(s) have no follow-up sent yet.")
         print(f"  Run with --send-followups to send them.")
 
     print(f"\nPENDING — sent, within 10 business days  ({len(pending)})")
@@ -602,27 +624,50 @@ def main():
     print("Gmail authenticated.\n")
 
     messages      = fetch_replies(service, sender_email)
-    label_id_map  = get_label_id_map(service, ["Done-Attachment", "Done-URL"])
+    label_id_map  = get_label_id_map(service, [
+        "Done-Attachment", "Done-URL",
+        "Done-Follow Up Yes", "Done-Follow Up No",
+    ])
     print(f"Found {len(messages)} inbox message(s) matching PIR subject.\n")
 
     sent_rows   = [r for r in rows if r["_date_sent"].strip()]
     unresponded = [r for r in sent_rows if not r["_response_status"].strip()]
 
-    # Track which email groups already had a follow-up queued this run
-    # (prevents duplicate follow-ups when multiple messages match the same group)
-    followup_sent_emails: set[str] = set()
+    followup_sent_emails:     set[str] = set()  # dedup follow-up sends per PIO email
+    followup_response_rows:   set[int] = set()  # dedup follow-up response writes per row
 
-    matched_count   = 0
-    unmatched_count = 0
-    followup_count  = 0
+    matched_count        = 0
+    unmatched_pir_count  = 0
+    followup_count       = 0
+    fu_response_count    = 0
 
     for msg in messages:
-        parsed  = parse_message(msg)
-        matches = match_rows(parsed, unresponded)
+        parsed = parse_message(msg)
+        lids   = parsed["label_ids"]
 
+        fu_yes_id = label_id_map.get("Done-Follow Up Yes", "")
+        fu_no_id  = label_id_map.get("Done-Follow Up No",  "")
+        is_fu_yes = bool(fu_yes_id) and fu_yes_id in lids
+        is_fu_no  = bool(fu_no_id)  and fu_no_id  in lids
+
+        # ── Follow-up response detection (independent of PIR response logic) ──
+        if is_fu_yes or is_fu_no:
+            fu_answer = "Yes" if is_fu_yes else "No"
+            fu_matches = match_rows(parsed, sent_rows)
+            for r in fu_matches:
+                if r["_row"] not in followup_response_rows and not r["_followup_response"].strip():
+                    print(f"  FOLLOW-UP RESPONSE ({fu_answer}): {r['_district_name']}")
+                    write_followup_response(sheet, r["_row"], fu_answer, args.dry_run)
+                    followup_response_rows.add(r["_row"])
+                    fu_response_count += 1
+
+        # ── PIR response detection ─────────────────────────────────────────────
+        matches = match_rows(parsed, unresponded)
         if not matches:
-            print(f"  UNMATCHED: from={parsed['from_raw']!r}  subj={parsed['subject']!r}")
-            unmatched_count += 1
+            # Only report as unmatched if it's not purely a follow-up response label
+            if not (is_fu_yes or is_fu_no):
+                print(f"  UNMATCHED: from={parsed['from_raw']!r}  subj={parsed['subject']!r}")
+                unmatched_pir_count += 1
             continue
 
         status = classify(parsed, label_id_map)
@@ -636,7 +681,6 @@ def main():
 
         matched_count += 1
 
-        # Send follow-up for Doc Received, once per PIO email address per run
         if args.send_followups and status in ("Doc Received", "URL Received"):
             pio_email = matches[0]["_pio_email"].strip().lower()
             already_sent = any(r["_followup_sent"].strip() for r in matches)
@@ -650,11 +694,13 @@ def main():
                     followup_sent_emails.add(pio_email)
                     followup_count += 1
 
-    print(f"\n{matched_count} message(s) matched, {unmatched_count} unmatched.")
-    if unmatched_count:
+    print(f"\n{matched_count} PIR response(s) matched, {unmatched_pir_count} unmatched.")
+    if unmatched_pir_count:
         print("  Review unmatched messages manually — they may be auto-replies or unrelated inbox mail.")
     if followup_count:
         print(f"  Follow-up emails sent: {followup_count}")
+    if fu_response_count:
+        print(f"  Follow-up responses recorded: {fu_response_count}")
 
     rows = load_rows(sheet)
     print_report(rows)
