@@ -222,7 +222,7 @@ def load_rows(sheet) -> list[dict]:
 def ensure_response_headers(sheet) -> None:
     """Write O1/P1/Q1 headers if blank."""
     header_row = sheet.row_values(1)
-    while len(header_row) < COL_FOLLOWUP_SENT:
+    while len(header_row) < COL_FOLLOWUP_RESPONSE:
         header_row.append("")
     needed = {
         COL_RESPONSE_DATE:     "Response_Date",
@@ -701,6 +701,49 @@ def main():
         print(f"  Follow-up emails sent: {followup_count}")
     if fu_response_count:
         print(f"  Follow-up responses recorded: {fu_response_count}")
+
+    # ── Second pass: follow-ups for already-responded rows ────────────────────
+    # Rows where response was logged in a prior run won't appear in `unresponded`,
+    # so the main loop never reaches their follow-up logic. Handle them here.
+    if args.send_followups:
+        rows = load_rows(sheet)
+        need_followup = [
+            r for r in rows
+            if r["_response_status"].strip() in ("Doc Received", "URL Received")
+            and not r["_followup_sent"].strip()
+        ]
+        if need_followup:
+            print(f"\nSending follow-ups for {len(need_followup)} previously-logged response(s)...")
+        for r in need_followup:
+            pio_email = r["_pio_email"].strip().lower()
+            if pio_email in followup_sent_emails:
+                continue
+            # Build a minimal parsed dict — no thread context since we can't
+            # re-match the original email, so this sends as a standalone reply.
+            stub_parsed = {
+                "from_email":     pio_email,
+                "from_raw":       pio_email,
+                "subject":        f"Public Information Request — {r['_district_name']} 2025-26 Salary Schedule",
+                "reply_date":     r["_response_date"],
+                "has_attachment": True,
+                "body_lower":     "",
+                "thread_id":      "",
+                "message_id_hdr": "",
+                "label_ids":      set(),
+            }
+            print(f"  [{r['_district_name']}] Sending follow-up to {pio_email}...")
+            ok = send_followup(
+                service, [r], stub_parsed, r["_response_status"],
+                sender_email, sender_name, args.dry_run,
+            )
+            if ok:
+                date = today_str()
+                write_followup_sent(sheet, r["_row"], date, args.dry_run)
+                followup_sent_emails.add(pio_email)
+                followup_count += 1
+
+    if followup_count:
+        print(f"  Total follow-ups sent this run: {followup_count}")
 
     rows = load_rows(sheet)
     print_report(rows)

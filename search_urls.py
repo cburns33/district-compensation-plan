@@ -59,6 +59,7 @@ COL_BEST_URL_CLASS = 12  # L
 COL_SEARCH_METHOD  = 13  # M
 COL_QA_STATUS      = 14  # N  (updated — shifted by 2 new cols)
 COL_REDIRECT_URL   = 15  # O
+COL_DOC_CLASS      = 16  # P  (written by classify_documents.py; cleared on reruns)
 
 WRITE_COL_MIN = COL_R1_URL       # 6  (F)
 WRITE_COL_MAX = COL_REDIRECT_URL # 15 (O)
@@ -88,6 +89,25 @@ NEWS_PENALTY_DOMAINS = [
     "mrt.com", "communityimpact", "dallasnews", "houstonchronicle",
     "statesman", "kvue", "nbcdfw", "wfaa", "indeed", "linkedin",
 ]
+
+# CDN / document-hosting platforms used legitimately by school districts.
+# Files hosted here may live on a different registered domain than the
+# district homepage — that's expected and should NOT trigger WRONG DOMAIN.
+KNOWN_DOC_CDNS = {
+    "finalsite.net",    # Finalsite — major school website/CDN platform
+    "thrillshare.com",  # Thrillshare — school communications platform
+    "boarddocs.com",    # BoardDocs — school board document management
+    "boardbook.org",    # BoardBook — board management system
+    "legistar.com",     # Granicus/Legistar board documents
+    "rschooltoday.com", # RSchoolToday activities platform
+    "campussuite.com",  # Campus Suite school CMS
+    "edl.edu",          # Education Service Center document host
+    "eboard.com",       # eBoard school CMS
+    "govserv.com",      # GovServ document platform
+    "wpmucdn.com",      # WordPress Multisite CDN (common school blogs)
+    "edliocdn.com",     # Edlio CDN
+    "sitelearning.com", # Site Learning school platform
+}
 
 QA_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -676,6 +696,18 @@ def parse_args():
         "--rerun-html", action="store_true",
         help="Re-search only rows where QA_Status (col N) is '✓ HTML', bypassing resume",
     )
+    parser.add_argument(
+        "--rerun-dead", action="store_true",
+        help="Re-search rows where QA_Status (col N) is '✗ DEAD' or '✗ TIMEOUT'",
+    )
+    parser.add_argument(
+        "--rerun-wrongdoc", action="store_true",
+        help="Re-search rows where Doc_Class (col P) is 'Wrong Doc'",
+    )
+    parser.add_argument(
+        "--rerun-error", action="store_true",
+        help="Re-search rows where Doc_Class (col P) is 'Error' or QA_Status is '⚠ REVIEW'",
+    )
     return parser.parse_args()
 
 
@@ -802,10 +834,47 @@ def main():
         rows_to_process = html_rows
         logger.info("--rerun-html: %d HTML rows to re-search", len(rows_to_process))
 
-    batch_buffer = []
-    start_time   = time.time()
-    processed    = 0
-    skipped      = 0
+    # --rerun-dead: narrow to DEAD/TIMEOUT rows
+    if args.rerun_dead:
+        dead_rows = []
+        for r in rows_to_process:
+            rd = all_values[r - 1]
+            qa = rd[COL_QA_STATUS - 1].strip() if len(rd) >= COL_QA_STATUS else ""
+            if qa in ("\u2717 DEAD", "\u2717 TIMEOUT"):
+                dead_rows.append(r)
+        rows_to_process = dead_rows
+        logger.info("--rerun-dead: %d DEAD/TIMEOUT rows to re-search", len(rows_to_process))
+
+    # --rerun-wrongdoc: narrow to rows where Doc_Class is 'Wrong Doc'
+    if args.rerun_wrongdoc:
+        wd_rows = []
+        for r in rows_to_process:
+            rd = all_values[r - 1]
+            doc_class = rd[COL_DOC_CLASS - 1].strip() if len(rd) >= COL_DOC_CLASS else ""
+            if doc_class == "Wrong Doc":
+                wd_rows.append(r)
+        rows_to_process = wd_rows
+        logger.info("--rerun-wrongdoc: %d Wrong Doc rows to re-search", len(rows_to_process))
+
+    # --rerun-error: narrow to rows where Doc_Class is 'Error' or QA_Status is '⚠ REVIEW'
+    if args.rerun_error:
+        err_rows = []
+        for r in rows_to_process:
+            rd = all_values[r - 1]
+            doc_class = rd[COL_DOC_CLASS - 1].strip() if len(rd) >= COL_DOC_CLASS else ""
+            qa = rd[COL_QA_STATUS - 1].strip() if len(rd) >= COL_QA_STATUS else ""
+            if doc_class == "Error" or qa == "\u26a0 REVIEW":
+                err_rows.append(r)
+        rows_to_process = err_rows
+        logger.info("--rerun-error: %d Error/REVIEW rows to re-search", len(rows_to_process))
+
+    rerun_mode = any([args.rerun_html, args.rerun_dead, args.rerun_wrongdoc, args.rerun_error])
+
+    batch_buffer       = []
+    rerun_rows_written = []   # rows re-searched; col P cleared after main loop
+    start_time         = time.time()
+    processed          = 0
+    skipped            = 0
 
     for sheet_row in rows_to_process:
         row_data = all_values[sheet_row - 1]  # 0-indexed
@@ -818,8 +887,8 @@ def main():
         homepage_url  = get_col(COL_HOMEPAGE)
         col_f_current = get_col(COL_R1_URL)
 
-        # Resume support — skip if already processed, unless --rerun-html
-        if col_f_current and not args.rerun_html:
+        # Resume support — skip if already processed, unless in a rerun mode
+        if col_f_current and not rerun_mode:
             skipped += 1
             logger.debug("Row %d: skipping (Col F already populated: %s)", sheet_row, col_f_current)
             continue
@@ -948,6 +1017,21 @@ def main():
                             best_label = best_label + " +crawl"
                             qa_status  = qa_check(best_url, logger)
 
+        # ── Domain mismatch guard ─────────────────────────────────────────────
+        # Flag if best URL is on an unrecognized third-party domain that doesn't
+        # match the district's homepage. Skip check for known CDN platforms that
+        # districts legitimately use to host their documents.
+        if qa_status.startswith("✓") and home_domain and best_url not in ("NO_RESULT", "API_ERROR"):
+            final_best_domain = tldextract.extract(best_url).registered_domain
+            if (final_best_domain
+                    and final_best_domain != home_domain
+                    and final_best_domain not in KNOWN_DOC_CDNS):
+                logger.warning(
+                    "Row %d | Domain mismatch: best_url domain=%s, homepage domain=%s — flagging as WRONG DOMAIN",
+                    sheet_row, final_best_domain, home_domain,
+                )
+                qa_status = "⚠ WRONG DOMAIN"
+
         logger.info("Row %d | QA: %s | time=%.1fs", sheet_row, qa_status, time.time() - row_start)
 
         # ── Buffer row ────────────────────────────────────────────────────────
@@ -961,6 +1045,8 @@ def main():
             qa_clean, redirect_url,
         ]
         batch_buffer.append({"row": sheet_row, "values": row_values})
+        if rerun_mode:
+            rerun_rows_written.append(sheet_row)
         processed += 1
 
         # ── Batch flush ───────────────────────────────────────────────────────
@@ -984,6 +1070,13 @@ def main():
 
     # ── Final flush ───────────────────────────────────────────────────────────
     flush_batch(sheet, batch_buffer)
+
+    # Clear Doc_Class (col P) for all rerun rows so classify_documents.py
+    # will re-process them on the next classification run.
+    if rerun_rows_written:
+        clear_data = [{"range": f"P{r}", "values": [[""]]} for r in rerun_rows_written]
+        sheet.batch_update(clear_data, value_input_option="USER_ENTERED")
+        logger.info("Cleared Doc_Class (col P) for %d rerun rows", len(rerun_rows_written))
 
     elapsed = elapsed_str(start_time)
     logger.info(

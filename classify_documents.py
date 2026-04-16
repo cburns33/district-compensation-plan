@@ -417,11 +417,12 @@ def classify_url(url: str, qa_status: str, redirect_url: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Classify district compensation plan documents.")
-    parser.add_argument("--dry-run",   action="store_true", help="Print what would be written; no sheet writes")
-    parser.add_argument("--limit",     type=int, default=0, help="Process first N eligible rows only")
-    parser.add_argument("--random",    type=int, default=0, metavar="N", help="Randomly sample N eligible rows (ignores --limit/--start-row/--end-row)")
-    parser.add_argument("--start-row", type=int, default=2, help="Sheet row to start from (default 2)")
-    parser.add_argument("--end-row",   type=int, default=0, help="Sheet row to stop at (0 = all rows)")
+    parser.add_argument("--dry-run",      action="store_true", help="Print what would be written; no sheet writes")
+    parser.add_argument("--limit",        type=int, default=0, help="Process first N eligible rows only")
+    parser.add_argument("--random",       type=int, default=0, metavar="N", help="Randomly sample N eligible rows (ignores --limit/--start-row/--end-row)")
+    parser.add_argument("--start-row",    type=int, default=2, help="Sheet row to start from (default 2)")
+    parser.add_argument("--end-row",      type=int, default=0, help="Sheet row to stop at (0 = all rows)")
+    parser.add_argument("--rerun-errors", action="store_true", help="Re-classify only rows where Doc_Class (col P) is 'Error', bypassing resume")
     args = parser.parse_args()
 
     logger = setup_logging()
@@ -493,10 +494,13 @@ def main():
     skipped_qa = 0
 
     for row_num, dist_name, best_url, qa_status, redirect_url, existing_class in all_values:
-        # Resume: skip already classified rows
+        # Resume: skip already classified rows, unless --rerun-errors targets Error rows
         if existing_class.strip():
-            skipped_resume += 1
-            continue
+            if args.rerun_errors and existing_class.strip() == "Error":
+                pass  # fall through and re-classify
+            else:
+                skipped_resume += 1
+                continue
 
         # Skip rows with no URL or failed QA
         if not best_url or not best_url.strip():
