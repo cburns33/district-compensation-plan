@@ -105,8 +105,12 @@ KNOWN_DOC_CDNS = {
     "eboard.com",       # eBoard school CMS
     "govserv.com",      # GovServ document platform
     "wpmucdn.com",      # WordPress Multisite CDN (common school blogs)
-    "edliocdn.com",     # Edlio CDN
+    "edliocdn.com",     # Edlio CDN (primary)
+    "edl.io",           # Edlio CDN (alternate short domain)
     "sitelearning.com", # Site Learning school platform
+    "sharpschool.com",  # SharpSchool school CMS
+    "amazonaws.com",    # AWS S3 — districts upload PDFs directly to S3
+    "google.com",       # Google Drive / Google Sites (drive.google.com, sites.google.com)
 }
 
 QA_USER_AGENT = (
@@ -708,6 +712,10 @@ def parse_args():
         "--rerun-error", action="store_true",
         help="Re-search rows where Doc_Class (col P) is 'Error' or QA_Status is '⚠ REVIEW'",
     )
+    parser.add_argument(
+        "--rerun-wrong-domain", action="store_true",
+        help="Re-search rows where QA_Status (col N) is '⚠ WRONG DOMAIN'",
+    )
     return parser.parse_args()
 
 
@@ -868,7 +876,35 @@ def main():
         rows_to_process = err_rows
         logger.info("--rerun-error: %d Error/REVIEW rows to re-search", len(rows_to_process))
 
-    rerun_mode = any([args.rerun_html, args.rerun_dead, args.rerun_wrongdoc, args.rerun_error])
+    # --rerun-wrong-domain: rows already flagged "⚠ WRONG DOMAIN" OR rows whose
+    # current Best_URL (col J) lives on a domain that doesn't match the district
+    # homepage and isn't a known CDN — catches rows written before the guard existed.
+    if args.rerun_wrong_domain:
+        wd_rows = []
+        for r in rows_to_process:
+            rd = all_values[r - 1]
+            qa         = rd[COL_QA_STATUS - 1].strip() if len(rd) >= COL_QA_STATUS else ""
+            best_url   = rd[COL_BEST_URL - 1].strip()  if len(rd) >= COL_BEST_URL  else ""
+            homepage   = rd[COL_HOMEPAGE - 1].strip()   if len(rd) >= COL_HOMEPAGE  else ""
+
+            if qa == "\u26a0 WRONG DOMAIN":
+                wd_rows.append(r)
+                continue
+
+            # Also catch rows whose URL has a domain mismatch that slipped through
+            # before the guard was in place (they still show ✓ PDF / ✓ HTML).
+            if best_url and best_url not in ("NO_RESULT", "API_ERROR") and homepage:
+                home_reg   = tldextract.extract(homepage).registered_domain
+                best_reg   = tldextract.extract(best_url).registered_domain
+                if (home_reg and best_reg
+                        and best_reg != home_reg
+                        and best_reg not in KNOWN_DOC_CDNS):
+                    wd_rows.append(r)
+
+        rows_to_process = wd_rows
+        logger.info("--rerun-wrong-domain: %d domain-mismatch rows to re-search", len(rows_to_process))
+
+    rerun_mode = any([args.rerun_html, args.rerun_dead, args.rerun_wrongdoc, args.rerun_error, args.rerun_wrong_domain])
 
     batch_buffer       = []
     rerun_rows_written = []   # rows re-searched; col P cleared after main loop
