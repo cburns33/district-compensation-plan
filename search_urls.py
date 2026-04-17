@@ -72,6 +72,7 @@ HEADERS_ROW = [
 ]
 
 SERPER_ENDPOINT = "https://google.serper.dev/search"
+TAVILY_ENDPOINT = "https://api.tavily.com/search"
 RATE_LIMIT_SLEEP = 1.5   # seconds between Serper calls
 RETRY_SLEEP      = 4.0   # seconds before retrying a failed Serper call
 QA_TIMEOUT       = 6     # seconds for HEAD request
@@ -105,6 +106,8 @@ WRONG_CDN_PATHS = {
     "saisd",       # San Antonio ISD Finalsite path
     "aldine",      # Aldine ISD Finalsite path
     "katyisd",     # Katy ISD Finalsite path (e.g. katyisdorg)
+    "anchisdcom",  # Aldine/Angleton CISD Thrillshare path (affects 40+ rural districts)
+    "ccisdnet",    # Clear Creek ISD Thrillshare path (2023-24 schedule, affects ~5 districts)
 }
 
 KNOWN_DOC_CDNS = {
@@ -350,7 +353,8 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
 
 # ── Tier-1.5 year-free fallback search ───────────────────────────────────────
 
-def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger, backend: str = "serper"):
+def call_serper_noyear(district_name: str, serper_key: str, brave_key: str, tavily_key: str,
+                       logger: logging.Logger, primary: str = "serper"):
     """
     Fallback query without any year qualifier. Used when the primary
     year-qualified search scores <= FALLBACK_SCORE_THRESHOLD, which happens
@@ -359,7 +363,7 @@ def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger,
     query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan"'
     logger.info("Tier-1.5 year-free fallback: %s", query)
     try:
-        return call_search(query, api_key, backend, logger)
+        return call_search(query, serper_key, brave_key, tavily_key, primary, logger)
     except Exception as exc:
         logger.warning("Tier-1.5 fallback failed: %s", exc)
         return []
@@ -367,7 +371,8 @@ def call_serper_noyear(district_name: str, api_key: str, logger: logging.Logger,
 
 # ── Tier-3 domain-scoped search ───────────────────────────────────────────────
 
-def call_serper_domain(homepage_url: str, api_key: str, logger: logging.Logger, backend: str = "serper"):
+def call_serper_domain(homepage_url: str, serper_key: str, brave_key: str, tavily_key: str,
+                       logger: logging.Logger, primary: str = "serper"):
     """
     Tier-3: fire a site:-scoped query restricted to the district's own domain.
     Used when the primary search winner lands on the wrong district's domain.
@@ -379,7 +384,7 @@ def call_serper_domain(homepage_url: str, api_key: str, logger: logging.Logger, 
     query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan"'
     logger.info("Tier-3 domain search: %s", query)
     try:
-        return call_search(query, api_key, backend, logger)
+        return call_search(query, serper_key, brave_key, tavily_key, primary, logger)
     except Exception as exc:
         logger.warning("Tier-3 search failed: %s", exc)
         return []
@@ -429,11 +434,74 @@ def call_brave(query: str, api_key: str, logger: logging.Logger):
                 raise
 
 
-def call_search(query: str, api_key: str, backend: str, logger: logging.Logger):
-    """Route to Serper or Brave based on backend setting."""
-    if backend == "brave":
-        return call_brave(query, api_key, logger)
-    return call_serper(query, api_key, logger)
+def call_tavily(query: str, api_key: str, logger: logging.Logger):
+    """
+    Call Tavily Search API and return up to 10 results in the same format
+    as call_serper: list of dicts with keys link, title, snippet.
+    On failure, raises after one retry.
+    """
+    payload = {
+        "query": query,
+        "max_results": 10,
+        "search_depth": "basic",
+        "include_answer": False,
+        "include_raw_content": False,
+    }
+    headers_req = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                TAVILY_ENDPOINT,
+                json=payload,
+                headers=headers_req,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = []
+            for item in (data.get("results", []))[:10]:
+                results.append({
+                    "link":    item.get("url", "NO_RESULT"),
+                    "title":   item.get("title", ""),
+                    "snippet": item.get("content", ""),
+                })
+            return results
+        except Exception as exc:
+            logger.warning("Tavily attempt %d failed: %s", attempt + 1, exc)
+            if attempt == 0:
+                time.sleep(RETRY_SLEEP)
+            else:
+                raise
+
+
+def call_search(query: str, serper_key: str, brave_key: str, tavily_key: str,
+                primary: str, logger: logging.Logger):
+    """
+    Try the primary backend first, then fall back through the others if it
+    fails. Raises only if every configured backend is exhausted.
+    """
+    all_backends = [
+        ("serper", call_serper, serper_key),
+        ("brave",  call_brave,  brave_key),
+        ("tavily", call_tavily, tavily_key),
+    ]
+    # Primary first, then the rest in default order; skip unconfigured
+    order = [b for b in all_backends if b[0] == primary and b[2]]
+    order += [b for b in all_backends if b[0] != primary and b[2]]
+
+    last_exc: Exception = RuntimeError("No search backends configured")
+    for i, (name, fn, key) in enumerate(order):
+        try:
+            return fn(query, key, logger)
+        except Exception as exc:
+            last_exc = exc
+            if i < len(order) - 1:
+                logger.warning("Backend '%s' failed (%s) — trying next backend", name, exc)
+    raise last_exc
 
 
 # ── Serper API ────────────────────────────────────────────────────────────────
@@ -786,7 +854,7 @@ def main():
     search_backend = os.environ.get("SEARCH_BACKEND", "serper").strip().lower()
     serper_key     = os.environ.get("SERPER_API_KEY", "").strip()
     brave_key      = os.environ.get("BRAVE_API_KEY", "").strip()
-    search_key     = brave_key if search_backend == "brave" else serper_key
+    tavily_key     = os.environ.get("TAVILY_API_KEY", "").strip()
     creds_path_raw = os.environ.get("GOOGLE_SHEETS_CREDS_JSON", "").strip()
     # Resolve relative paths from the project directory so .env is portable
     # across machines (Mac, Windows) regardless of absolute folder locations.
@@ -797,8 +865,10 @@ def main():
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
 
     missing = []
-    if search_backend == "brave" and not brave_key: missing.append("BRAVE_API_KEY")
-    if search_backend == "serper" and not serper_key: missing.append("SERPER_API_KEY")
+    if not any([serper_key, brave_key, tavily_key]):
+        missing.append("at least one of SERPER_API_KEY / BRAVE_API_KEY / TAVILY_API_KEY")
+    elif search_backend not in ("serper", "brave", "tavily"):
+        missing.append(f"SEARCH_BACKEND must be serper, brave, or tavily (got '{search_backend}')")
     if not creds_path:     missing.append("GOOGLE_SHEETS_CREDS_JSON")
     if not spreadsheet_id: missing.append("SPREADSHEET_ID")
     if missing:
@@ -915,12 +985,14 @@ def main():
                     wd_rows.append(r)
                     continue
 
-                # CDN path contamination: CDN domain is allowed but URL path is another district's
-                url_lower = best_url.lower()
-                for bad_path in WRONG_CDN_PATHS:
-                    if bad_path in url_lower:
-                        wd_rows.append(r)
-                        break
+                # CDN path contamination: only applies when the URL is actually on a
+                # whitelisted CDN domain (mirrors the runtime guard at the QA step).
+                if best_reg in KNOWN_DOC_CDNS:
+                    url_lower = best_url.lower()
+                    for bad_path in WRONG_CDN_PATHS:
+                        if bad_path in url_lower:
+                            wd_rows.append(r)
+                            break
 
         rows_to_process = wd_rows
         logger.info("--rerun-wrong-domain: %d wrong-domain/path rows to re-search", len(rows_to_process))
@@ -974,12 +1046,12 @@ def main():
         r1_snippet = r2_snippet = ""
 
         try:
-            results = call_search(query, search_key, search_backend, logger)
+            results = call_search(query, serper_key, brave_key, tavily_key, search_backend, logger)
             results = _pad_results(results)
             r1_url, r1_title, r1_snippet = results[0]["link"], results[0]["title"], results[0]["snippet"]
             r2_url, r2_title, r2_snippet = results[1]["link"], results[1]["title"], results[1]["snippet"]
         except Exception as exc:
-            logger.error("Row %d: Serper failed after retry: %s", sheet_row, exc)
+            logger.error("Row %d: All search backends failed: %s", sheet_row, exc)
             results = _pad_results([])
             r1_url = "API_ERROR"
 
@@ -1015,7 +1087,7 @@ def main():
                 sheet_row, best_score, FALLBACK_SCORE_THRESHOLD,
             )
             time.sleep(RATE_LIMIT_SLEEP)
-            fb_results = call_serper_noyear(district_name, search_key, logger, search_backend)
+            fb_results = call_serper_noyear(district_name, serper_key, brave_key, tavily_key, logger, search_backend)
             fb_results = _pad_results(fb_results)
             for r in fb_results:
                 if r["link"] in ("NO_RESULT", "API_ERROR"):
@@ -1051,7 +1123,7 @@ def main():
                 "Row %d | Tier-3: domain mismatch (%s ≠ %s), running site search",
                 sheet_row, best_domain, home_domain,
             )
-            t3_results = call_serper_domain(homepage_url, search_key, logger, search_backend)
+            t3_results = call_serper_domain(homepage_url, serper_key, brave_key, tavily_key, logger, search_backend)
             t3_results = _pad_results(t3_results)
             t3_scored = []
             for r in t3_results:
