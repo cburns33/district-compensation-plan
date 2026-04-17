@@ -9,9 +9,9 @@
 
 Three parallel tracks:
 
-1. **Phase 1 (COMPLETE)** — Search Google via Serper.dev for each of ~895 Texas
-   school district compensation plan URLs. Score, QA-check, and write results to
-   the **Unique Districts** tab of a Google Sheet.
+1. **Phase 1 (COMPLETE)** — Search Google/Brave for each of ~895 Texas school
+   district compensation plan URLs. Score, QA-check, classify, and write results
+   to the **Unique Districts** tab of a Google Sheet.
 
 2. **Phase 2 (IN DESIGN)** — Extract full step/lane salary matrices from found
    documents into a normalized database. Target output feeds two products:
@@ -25,7 +25,7 @@ Three parallel tracks:
 
 3. **PIR Track (IN PROGRESS)** — Send Public Information Requests to 196 Texas
    school districts (188 charters + 8 non-charter ISDs) whose salary schedules
-   aren't publicly available online. Emails sending in daily batches of 40.
+   aren't publicly available online. Emails sent; responses being tracked.
 
 ---
 
@@ -34,6 +34,7 @@ Three parallel tracks:
 `.env` file in project root (never committed):
 ```
 SERPER_API_KEY=...
+BRAVE_API_KEY=...
 GOOGLE_SHEETS_CREDS_JSON=district-compensation-search-e9f9f750566f.json
 SPREADSHEET_ID=...
 GMAIL_CREDENTIALS_JSON=gmail-api.json
@@ -41,7 +42,7 @@ GMAIL_SENDER_EMAIL=chase.burns@talos-advisory.com
 PIR_SENDER_NAME=Chase Burns
 ```
 
-Two JSON credential files in project root (never committed):
+Credential files in project root (never committed):
 - `district-compensation-search-*.json` — Google service account (Sheets access)
 - `gmail-api.json` — Gmail OAuth Desktop client
 - `token.json` — saved Gmail OAuth token for send_pir.py (gmail.send scope)
@@ -59,86 +60,156 @@ pip install -r requirements.txt
 
 ```
 district-compensation-plan/
-├── search_urls.py              # Phase 1: URL search (COMPLETE — do not re-run full)
-├── remediate.py                # Phase 1: targeted fix for failed rows (run once, done)
-├── find_pio_contacts.py        # PIR Track: PIO email discovery (COMPLETE)
-├── send_pir.py                 # PIR Track: send PIR emails (IN PROGRESS — batches running)
+├── search_urls.py              # Phase 1: URL search — writes cols F–O
+├── classify_documents.py       # Phase 1: document classification — writes cols P–S
+├── qa_pipeline.py              # Phase 1: orchestrated QA cleanup (run after any bulk search)
+├── remediate.py                # Phase 1: one-time fix script — COMPLETE, do not re-run
+├── find_pio_contacts.py        # PIR Track: PIO email discovery — COMPLETE
+├── send_pir.py                 # PIR Track: send PIR emails — all 196 sent
 ├── check_pir_responses.py      # PIR Track: scan Gmail for replies, update sheet, print report
 ├── requirements.txt
-├── HANDOFF.md                  # This file
+├── README.md                   # Setup and usage reference
+├── HANDOFF.md                  # This file — authoritative project state
 ├── .gitignore
 ├── .env                        # Not committed
 ├── district-compensation-search-*.json  # Not committed
 ├── gmail-api.json              # Not committed
-├── token.json                  # Not committed (send_pir.py OAuth token, gmail.send)
-├── token_reader.json           # Not committed (check_pir_responses.py OAuth token, gmail.readonly+send)
-└── logs/                       # Timestamped run logs + empty_run_count.txt (not committed)
+├── token.json                  # Not committed (send_pir.py OAuth token)
+├── token_reader.json           # Not committed (check_pir_responses.py OAuth token)
+└── logs/                       # Timestamped run logs (not committed)
 ```
 
-`migrate_columns.py` also exists — a one-time migration script that was never
-run because the user migrated the columns manually.
+`migrate_columns.py` also exists — a one-time migration script, never run (user migrated manually).
 
 ---
 
-## Phase 1 — URL Search (COMPLETE)
+## Phase 1 — URL Search + Classification (COMPLETE)
 
 ### Google Sheet: "Unique Districts" tab
 
-| Col | Header | Contents |
-|-----|--------|----------|
-| A | District_Web_Address | District homepage URL |
-| B | Enrollment | |
-| C | District_Number | |
-| D | District_Name | |
-| E | District_Type | |
-| **F** | Result_1_URL | Top Serper result URL |
-| **G** | Result_1_Title | Top Serper result title |
-| **H** | Result_2_URL | Second Serper result URL |
-| **I** | Result_2_Title | Second Serper result title |
-| **J** | Best_URL | Highest-scoring URL |
-| **K** | Best_Score | Numeric score (e.g. `7`) |
-| **L** | Best_URL_Classification | e.g. `R1`, `R4`, `T3` |
-| **M** | Search_Method | e.g. `+fallback`, `+domain`, `+fixed` |
-| **N** | QA_Status | `✓ PDF`, `✓ HTML`, `✗ DEAD`, `✗ TIMEOUT`, `⚠ REVIEW` |
-| **O** | Redirect_URL | Final URL after redirect (if any) |
+| Col | Header | Written by | Contents |
+|-----|--------|------------|----------|
+| A | District_Web_Address | pre-populated | District homepage URL |
+| B | Enrollment | pre-populated | |
+| C | District_Number | pre-populated | |
+| D | District_Name | pre-populated | |
+| E | District_Type | pre-populated | |
+| F | Result_1_URL | search_urls.py | Top search result URL |
+| G | Result_1_Title | search_urls.py | |
+| H | Result_2_URL | search_urls.py | Second result URL |
+| I | Result_2_Title | search_urls.py | |
+| J | Best_URL | search_urls.py | Highest-scoring URL |
+| K | Best_Score | search_urls.py | Numeric score (e.g. `7`) |
+| L | Best_URL_Classification | search_urls.py | `R1`, `R2`, `T3` |
+| M | Search_Method | search_urls.py | `+fallback`, `+domain`, `+crawl`, `+fixed` |
+| N | QA_Status | search_urls.py | `✓ PDF`, `✓ HTML`, `⚠ WRONG DOMAIN`, `⚠ WRONG PATH`, etc. |
+| O | Redirect_URL | search_urls.py | Final URL after redirect (if any) |
+| P | Doc_Class | classify_documents.py | `Simple`, `Medium`, `Complex`, `Skipped`, `Error`, etc. |
+| Q | Doc_Pages | classify_documents.py | Page count |
+| R | Doc_Tables | classify_documents.py | Table count |
+| S | Doc_Notes | classify_documents.py | Keyword sample or error detail |
 
-Scripts write **only columns F–O (indices 6–15)**. Column guard enforced in code.
+Scripts write only their allowed column ranges. Column guard enforced in code — any write
+outside the allowed range raises `RuntimeError` and halts.
 
-### Status
+### Current Doc_Class Breakdown (as of 2026-04-16)
 
-- All ~895 rows processed.
-- `remediate.py` was run once to fix 38 failed rows (DEAD/TIMEOUT/REVIEW):
-  - Stage 1: GET fallback on existing Best_URL — fixed 7
-  - Stage 2: Re-score R1/R2 already in sheet — fixed 17
-  - Stage 3: Fresh year-free Serper query — fixed 14
-- All 38 rows resolved. Do not re-run remediate.py.
+| Doc_Class | Count | Notes |
+|-----------|-------|-------|
+| Complex | 269 | >15 pages or dense multi-table structure |
+| Simple | 161 | ≤3 pages, salary keywords found |
+| Medium | 60 | 4–15 pages |
+| Skipped | 350 | No valid URL (WRONG DOMAIN, WRONG PATH, DEAD, etc.) |
+| Unreadable | 27 | Scanned PDFs — no extractable text |
+| HTML | 17 | HTML pages, no downloadable doc found |
+| Error | 4 | Corrupt or oversized PDFs |
+| Blank | 8 | ⚠ REVIEW with no URL — small rural districts, in PIR bucket |
 
-### How search_urls.py works (for reference)
+490 districts have real classified documents. 350 districts have no findable comp plan
+online — most are in the PIR bucket or are tiny rural districts that don't publish online.
 
-**3-tier search logic:**
+### Search History
 
-- **Tier 1** — Serper query with current year:
-  `{district} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"`
-  Scores all 10 results. Best wins.
+- All ~895 rows processed via search_urls.py (multiple passes over several sessions).
+- `remediate.py` was run once to fix 38 failed rows (DEAD/TIMEOUT/REVIEW) — do not re-run.
+- Multiple QA cleanup passes were run to fix wrong-domain and CDN-path contamination.
+- See "QA Cleanup" section below for the current process.
 
-- **Tier 1.5** — If best score ≤ 3, re-queries without year qualifier. Prevents
-  stale news articles from blocking correct untagged content.
+---
 
-- **Tier 2** — If winner is HTML, crawls it for PDF/XLSX links matching salary
-  keywords. Upgrades Best_URL if found.
+## QA Cleanup — Running and Maintaining Data Quality
 
-- **Tier 3** — If winner's domain doesn't match district homepage, fires a
-  `site:{domain}` scoped Serper query.
+### When to Run
 
-**Scoring:**
+After any large re-search (new districts, updated scoring logic, a fresh `--start-row 2`
+run). Not needed after small targeted patches.
 
-| Rule | Points |
-|------|--------|
-| URL ends `.pdf` or `.xlsx` | +3 |
-| Domain matches district homepage | +2 |
-| Contains year pattern | +2 |
-| Contains salary/compensation keyword | +1 |
-| URL is from news/social domain | -2 |
+### The Pipeline
+
+`qa_pipeline.py` orchestrates all five rerun passes in the correct order, runs
+`classify_documents.py` after each pass, and prints a before/after Doc_Class table.
+
+```bash
+# Full cleanup — all five passes
+python qa_pipeline.py
+
+# Specific passes only (e.g. after a scoring change only affects DEAD rows)
+python qa_pipeline.py --passes dead error
+
+# Preview what would run — no API calls, no sheet writes
+python qa_pipeline.py --dry-run
+
+# Search passes only, skip classify between passes (faster initial scan)
+python qa_pipeline.py --no-classify
+```
+
+### Pass Order and What Each Targets
+
+| Order | Pass name | Flag | Targets |
+|-------|-----------|------|---------|
+| 1 | dead | `--rerun-dead` | `✗ DEAD` or `✗ TIMEOUT` — broken links |
+| 2 | error | `--rerun-error` | `Error` Doc_Class or `⚠ REVIEW` QA_Status |
+| 3 | wrong-domain | `--rerun-wrong-domain` | `⚠ WRONG DOMAIN`, `⚠ WRONG PATH`, or any existing URL with undetected domain/CDN-path mismatch |
+| 4 | wrongdoc | `--rerun-wrongdoc` | `Wrong Doc` Doc_Class — fetched OK, no salary keywords |
+| 5 | html | `--rerun-html` | `✓ HTML` rows — tries to upgrade to direct PDF |
+
+**Pass 3 is the most important.** Search engines frequently return FWISD, HISD, or College
+Station ISD documents for unrelated small rural districts. Two guards in search_urls.py
+catch this:
+
+- **Domain mismatch guard** — flags `⚠ WRONG DOMAIN` if the URL's registered domain
+  doesn't match the district homepage and isn't in `KNOWN_DOC_CDNS`.
+- **CDN path guard** — flags `⚠ WRONG PATH` if the URL is on a whitelisted CDN
+  (Finalsite, Thrillshare, etc.) but contains a known large-district path token
+  (e.g. `/fwisdorg/`, `/houstonisd/`, `/katyisd/`).
+
+Both are defined as constants at the top of `search_urls.py` (`KNOWN_DOC_CDNS`,
+`WRONG_CDN_PATHS`) and should be expanded as new contaminants are identified.
+
+### Rerun Flags (individual use)
+
+Each pass can also be run directly on `search_urls.py` without the pipeline:
+
+```bash
+python search_urls.py --rerun-dead
+python search_urls.py --rerun-error
+python search_urls.py --rerun-wrong-domain
+python search_urls.py --rerun-wrongdoc
+python search_urls.py --rerun-html
+```
+
+Always run `python classify_documents.py` after any rerun to re-classify the cleared rows.
+The rerun logic automatically clears col P (Doc_Class) for re-searched rows so classify
+knows to re-process them.
+
+### Adding a New Rerun Pass
+
+To add a new pass type to the pipeline:
+
+1. Add `--rerun-{name}` argparse flag to `search_urls.py`
+2. Add the filter block in `main()` (after the existing rerun blocks)
+3. Add the pass name to `rerun_mode = any([...])` in `search_urls.py`
+4. Add entries to `PASS_ORDER`, `PASS_FLAGS`, `PASS_LABELS` in `qa_pipeline.py`
 
 ---
 
@@ -181,117 +252,56 @@ find_pio_contacts.py write guard: cols D, F, H, J only.
 send_pir.py write guard: cols G, N only.
 check_pir_responses.py write guard: cols O, P, Q only.
 
-### Current PIR Send Progress (as of 2026-04-14)
+### Current PIR Status (as of 2026-04-16)
 
-- **Total districts:** 196 (188 original charters + 8 non-charter ISDs added manually)
-- **Batch 1 sent:** 40 groups on 2026-04-13
-- **Batch 2 sent:** 40 groups on 2026-04-14 (run manually — scheduled task stalled, see below)
-- **Remaining:** ~100 groups
-- **Daily schedule:** 40 groups/day at 9:05 AM via Claude scheduled task `pir-daily-send`
-- **KNOWN ISSUE:** Scheduled task requires Bash tool pre-approval. Click "Run now" from
-  the Scheduled section in the Claude Code sidebar once to approve — then it runs unattended.
+- **All 196 districts emailed** (188 original charters + 8 non-charter ISDs added manually)
+- **Follow-ups sent** to all districts with Doc Received or URL Received status
+- **8 non-charter ISDs in PIR bucket:** Claude ISD, Pettus ISD, Panther Creek CISD,
+  Seminole ISD, McLean ISD, North Hopkins ISD, Coolidge ISD, Munday CISD
+- **10-business-day deadline window** is active; run `check_pir_responses.py` periodically
 
-**8 non-charter ISDs added to PIR_Tracking (Status=PIO_FOUND, PIO_Source=Manual):**
-Claude ISD, Pettus ISD, Panther Creek CISD, Seminole ISD, McLean ISD, North Hopkins ISD,
-Coolidge ISD, Munday CISD (Munday has blank name fields — email/name mismatch in source data;
-defaults to role-based salutation).
-
-**All corrections to date:**
-- **ACCELERATED INTERMEDIATE ACADEMY** — resent to `aiapeims2020b@aol.com` (district-provided)
-- **BASIS TEXAS** — resent to `ANDREW.FREEMAN@BTXSCHOOLS.ORG` (CFO, AskTED backup)
-- **WINFREE ACADEMY CHARTER SCHOOLS** — resent to `dstaples@wacsd.com` (Deirdre Staples)
+**Corrections to date:**
+- **ACCELERATED INTERMEDIATE ACADEMY** — resent to `aiapeims2020b@aol.com`
+- **BASIS TEXAS** — resent to `ANDREW.FREEMAN@BTXSCHOOLS.ORG` (CFO)
+- **WINFREE ACADEMY CHARTER SCHOOLS** — resent to `dstaples@wacsd.com`
 - **UT TYLER UNIVERSITY ACADEMY** — submitted via web portal; Send_Status = "Submitted via portal"
-- **EDUCATION CENTER INTERNATIONAL ACADEMY** — resent to `bdensmore@eciacharter.com` (Bobby Densmore, Asst. Supt.)
-- **RAPOPORT ACADEMY PUBLIC SCHOOL** — original contact no longer employed; resent to `mnelson@rapswaco.org` (Melanie Nelson); wrong Denial status cleared from cols O/P
-- **NOVA ACADEMY** — resent to `admissions.austin@novaacademy.school` (no name; role salutation)
-- **COMPASS ROSE PUBLIC SCHOOLS** — resent to `PublicInfoRequest@compassroseschools.org` (no name; role salutation)
-- **PRELUDE PREPARATORY CHARTER SCHOOL** — resent to `Office@preludeprep.org` (no name; role salutation)
+- **EDUCATION CENTER INTERNATIONAL ACADEMY** — resent to `bdensmore@eciacharter.com`
+- **RAPOPORT ACADEMY PUBLIC SCHOOL** — resent to `mnelson@rapswaco.org`; wrong Denial cleared
+- **NOVA ACADEMY** — resent to `admissions.austin@novaacademy.school`
+- **COMPASS ROSE PUBLIC SCHOOLS** — resent to `PublicInfoRequest@compassroseschools.org`
+- **PRELUDE PREPARATORY CHARTER SCHOOL** — resent to `Office@preludeprep.org`
+- **MIDLAND ACADEMY CHARTER SCHOOL** — resent to `kcoker@macharter.org`
 
 ### find_pio_contacts.py — COMPLETE
 
-Email discovery is done. All 188 rows have a PIO_Email populated from AskTED.
-Do not re-run this script unless a new district is added to PIR_Tracking.
+Email discovery is done. All 196 rows have a PIO_Email populated.
+Do not re-run unless a new district is added to PIR_Tracking.
 
-**Commands (for reference):**
+### send_pir.py — ALL SENT
+
+All 196 districts have been emailed. Do not run a standard send.
+
+Use `--force` only to correct and resend a specific district:
 ```bash
-# Validate logic against 4 known charters (no sheet access, uses Serper)
-python find_pio_contacts.py --test
-
-# Single district by District_Number
-python find_pio_contacts.py --district-number 057829
-
-# Re-process a row (overwrites)
-python find_pio_contacts.py --district-number 057829 --force
-
-# Preview without API or sheet writes
-python find_pio_contacts.py --dry-run
-```
-
-### send_pir.py — IN PROGRESS (batches sending daily)
-
-Sends TPIA-compliant PIR emails via Gmail API. Districts that share the same
-PIO email address receive a single grouped email listing all districts — legally
-equivalent to separate PIRs, avoids near-identical duplicates in the same inbox.
-
-**Commands:**
-```bash
-# Show grouping table (who shares an address) — no sends
-python send_pir.py --groups
-
-# Preview emails — no sends, no sheet writes
-python send_pir.py --dry-run
-
-# Send next batch (capped at 40 groups — runs automatically via scheduler)
-python send_pir.py
-
-# Send first N groups only
-python send_pir.py --limit 5
-
-# Correct a contact and resend in one atomic operation
+# Correct a contact and resend
 python send_pir.py --district-number 57828 \
   --update email=dstaples@wacsd.com full_name="Deirdre Staples" first_name=Deirdre last_name=Staples \
   --force
 ```
 
-**IMPORTANT — correcting a contact email:**
-Always use `--update` rather than editing the sheet manually. It enforces that
-email and name fields are updated together. The script blocks an email-only
-update with no name fields — this prevents stale salutations going out to the
-wrong person's name.
+**IMPORTANT:** Always use `--update` rather than editing the sheet directly. The guard
+requires name fields alongside any email change to prevent stale salutations.
 
-**Salutation logic (in order of priority):**
-1. First + Last name in cols L/M → `Dear Jana Coulter,`
-2. First name only → `Dear Jana,`
-3. No name, known role → role display name (e.g. `Dear Human Resources Director,`)
-4. Fallback → `Dear Public Information Officer,`
+### check_pir_responses.py — Ongoing
 
-"School Email (Directory)" and "Manual" never appear verbatim in email text.
+Scans Gmail inbox for replies. Writes Response_Date (col O) and Response_Status (col P).
+Uses `token_reader.json` (gmail.readonly + gmail.send scopes).
 
-**Scheduled task:** `pir-daily-send` runs at 9:05 AM daily via Claude Code
-scheduler. Auto-disables after 3 consecutive empty runs. Monitor from the
-Scheduled section in the Claude Code sidebar.
-
-**Rate limit:** 40 email groups per run, 2s delay between sends.
-Sending from `chase.burns@talos-advisory.com` (Google Workspace, talos-advisory.com).
-
-### check_pir_responses.py — Response tracking
-
-Scans Gmail inbox for replies to PIR emails. Writes Response_Date (col O) and
-Response_Status (col P) to PIR_Tracking. Prints a deadline report.
-
-Uses a separate Gmail OAuth token (`token_reader.json`, `gmail.readonly + gmail.send` scopes)
-so it never interferes with `send_pir.py`'s send token.
-
-**Response status values:** `Doc Received`, `URL Received`, `Delay Notice`, `Denial`, `See Portal`, `Responded`
-
-**Matching priority:** exact PIO_Email match > sender domain match > district name in subject
-
-**Commands:**
 ```bash
-# Full run: scan Gmail + update sheet + print report
+# Full run: scan Gmail + update sheet + print deadline report
 python check_pir_responses.py
 
-# Full run + send follow-up emails for Doc Received responses
+# Full run + send follow-up emails for Doc/URL Received responses
 python check_pir_responses.py --send-followups
 
 # Scan Gmail + print matches, no sheet writes, no sends
@@ -301,26 +311,18 @@ python check_pir_responses.py --dry-run
 python check_pir_responses.py --report
 ```
 
-**PIR_Tracking columns added by this script:**
+**Response status values:** `Doc Received`, `URL Received`, `Delay Notice`, `Denial`, `See Portal`, `Responded`
 
-| Col | Header | Contents |
-|-----|--------|----------|
-| O | Response_Date | Date reply received (`YYYY-MM-DD`) |
-| P | Response_Status | `Doc Received`, `Delay Notice`, `Denial`, `See Portal`, `Responded` |
-| Q | Followup_Sent | Date follow-up email sent (`YYYY-MM-DD`), blank if not sent |
-
-**Follow-up email:** Short, informal reply into the original thread. Two variants:
-- `Doc Received` — asks whether the schedule is posted on their website
-- `URL Received` — confirms whether that URL is where they post it annually
-Sent only once per PIO email address. Threads correctly into the original email chain.
-Also searches `label:Done-Attachment` and `label:Done-URL` Gmail labels so archived
-threads are included.
+**Matching priority:** exact PIO_Email match > sender domain match > district name in subject
 
 **Deadline report categories:**
 - `OVERDUE` — past 10 business days, no response
-- `APPROACHING` — 8-10 business days, no response
+- `APPROACHING` — 8–10 business days, no response
 - `RESPONDED` — any response received, with status and date
-- `PENDING` — sent, within 10 business days (count only)
+- `PENDING` — sent, within 10 business days
+
+**Follow-up email:** Short reply into the original thread. Sent once per PIO address.
+Also searches `label:Done-Attachment` and `label:Done-URL` Gmail labels for archived threads.
 
 ---
 
@@ -328,11 +330,17 @@ threads are included.
 
 ### Goal
 
-Build a normalized salary database with the full step/lane matrix per district —
-not just anchor points. Each cell: district × school_year × step × lane → dollar amount.
+Build a normalized salary database with the full step/lane matrix per district.
+Each cell: `district × school_year × step × lane → dollar amount`.
 This is the core data asset for both products.
 
-### Products this feeds
+### Extraction Target
+
+Start with the 161 **Simple** rows (≤3 pages, salary keywords confirmed) — these are the
+cleanest inputs for building and validating the extraction logic before scaling to
+Medium/Complex rows.
+
+### Products This Feeds
 
 **Product 1 — Teacher Compensation Dashboard**
 Teacher inputs TIA designation tier, years of experience, degree level, subject/role.
@@ -340,67 +348,81 @@ Gets projected total compensation (base + TIA allotment) at any TX district, cur
 year and career projection. No comparable tool exists today.
 
 **Product 2 — Intervention Benefit-Cost Analysis Engine**
-District administrators connect intervention implementation records with shadow-priced
-staff costs (derived from salary schedules) to produce cost-per-outcome efficiency ratios.
-Designed to interoperate with district data via Ed-Fi data standards.
+District administrators connect intervention records with shadow-priced staff costs
+(derived from salary schedules) to produce cost-per-outcome efficiency ratios.
+Interoperates with district data via Ed-Fi data standards.
 
 ### Database
 
-SQLite during build phase, Postgres at deployment. Schema follows Ed-Fi data standards
+SQLite during build phase, Postgres at deployment. Schema follows Ed-Fi standards
 from the start so Product 2 can sync with district data in the Ed-Fi exchange.
 ORM: SQLAlchemy (connection string swap = SQLite → Postgres).
 
-### Extraction pipeline (planned)
+### Planned Extraction Pipeline
 
-**Stage 1 — Format classification**
-Classify each Best_URL as: structured PDF, Excel/CSV, HTML table, or scanned PDF.
-Scanned PDFs require OCR (pytesseract) and are a separate sub-problem.
-
-**Stage 2 — Automated extraction by format**
+**Stage 1 — Automated extraction by format**
 - `✓ XLSX` → pandas / openpyxl (cleanest, build first)
-- `✓ PDF` → pdfplumber for table detection
+- `✓ PDF` → pdfplumber table detection
 - `✓ HTML` → BeautifulSoup table scrape
-- JS-rendered → Playwright headless browser fallback
+- Scanned PDF / JS-rendered → OCR / Playwright fallback
 
-**Stage 3 — Normalization**
+**Stage 2 — Normalization**
 Map heterogeneous lane labels (BA, BS, Column I, Bachelors, Degree 1) to canonical set.
 Map step labels (Year 0, Step 1, 0-1 yrs, Beginning) to integer years.
 Flag unresolved cells for manual review.
 
-### Pilot
+**Pilot:** Start with PIR response documents (small known set, files in hand, easy to
+verify by eye). Build and validate schema on those before scaling to Phase 1 URLs.
 
-Start with PIR response documents (small known set, files in hand, easy to verify
-by eye). Build and validate the extractor and schema on those before scaling to
-Phase 1 URLs.
+### Universal Comparable Schema
+
+Even complex pay structures (HISD NES model, TIA-linked pay, subject-differentiated lanes)
+can be reduced to four universal anchor points for cross-district comparison:
+
+| Anchor | Meaning |
+|--------|---------|
+| Entry salary | Step 0/1, minimum lane (BA) |
+| Mid-career salary | Step 10, minimum lane |
+| MA premium | Salary difference between BA and MA lanes at Step 0 |
+| Ceiling | Maximum salary in schedule |
+
+These four values work even for the simplest (Milford ISD style) schedules and remain
+meaningful for complex ones.
 
 ---
 
 ## Important Behavioral Notes
 
-- **Never re-run search_urls.py on already-processed rows.** Resume logic skips
-  rows with col F populated, but be careful with `--start-row` overrides.
+- **Never re-run search_urls.py on all rows.** The full search run is complete. Use
+  `qa_pipeline.py` or individual `--rerun-*` flags for targeted cleanup only.
 - **Never re-run remediate.py.** It was a one-time fix pass.
-- **Serper credits cost money.** Always run `--test` or `--dry-run` before a
-  live batch run. Ask before running any command that consumes credits.
-- **Column safety guards** are enforced in every script. Any write outside the
-  allowed range raises a `RuntimeError` and halts.
-- **Windows UTF-8**: all scripts have a stdout/stderr wrapper to handle
-  Unicode symbols (✓, ⚠, ✗) on Windows cp1252 consoles.
-- **Correcting a sent email:** use `send_pir.py --update ... --force`, never
-  edit the sheet directly. The guard requires name fields alongside any email
-  change to prevent stale salutations.
-- **Email HTML rendering:** both send_pir.py and check_pir_responses.py use
-  `<div>` + `<p>` tags for HTML email bodies (not `<pre>`). This ensures emails
-  render at full width with proportional fonts in all clients.
+- **Never run find_pio_contacts.py on all rows.** Discovery is complete.
+- **All 196 PIR emails are sent.** Never run `send_pir.py` without `--district-number`
+  and `--force` unless adding genuinely new districts.
+- **Serper/Brave credits cost money.** Always use `--dry-run` before a live run. The
+  `qa_pipeline.py --dry-run` flag previews all passes without any API calls.
+- **Column safety guards** are enforced in every script. Any write outside the allowed
+  range raises `RuntimeError` and halts.
+- **Windows UTF-8:** all scripts have a stdout/stderr wrapper to handle Unicode symbols
+  (✓, ⚠, ✗) on Windows cp1252 consoles.
+- **Correcting a sent email:** use `send_pir.py --update ... --force`, never edit the
+  sheet directly. The guard requires name fields alongside any email change.
+- **Email HTML rendering:** send_pir.py and check_pir_responses.py use `<div>` + `<p>`
+  tags (not `<pre>`). Renders at full width with proportional fonts in all clients.
 
 ---
 
 ## Known Issues / Limitations
 
-- **UT Tyler University Academy** uses a web portal for PIR submissions rather
-  than a direct email address. Any future charter school that responds similarly
-  should have its Send_Status set to "Submitted via portal" manually.
-- **JS-routed pages**: some district sites use React/Next.js routing and return
-  blank HTML to the requests library. Stage 2 crawl misses emails on these.
-- **Generic addresses (info@, contact@)**: valid PIR recipients if on the
-  district's own domain. Not filtered out.
+- **UT Tyler University Academy** uses a web portal for PIR submissions. Any future
+  district that responds similarly should have Send_Status set to "Submitted via portal".
+- **JS-routed pages:** some district sites use React/Next.js and return blank HTML to
+  requests. Stage 2 crawl misses content on these.
+- **8 blank Doc_Class rows:** Seminole ISD, North Hopkins ISD, Munday CISD, Pettus ISD,
+  Claude ISD, Coolidge ISD, McLean ISD, Panther Creek CISD — all have `⚠ REVIEW` with
+  no URL. All are in the PIR bucket. Not worth a rerun.
+- **49 remaining WRONG DOMAIN rows:** small rural districts where search consistently
+  returns another district's document. Tier-3 domain search finds nothing on their domain.
+  These will be PIR bucket or manual lookup.
+- **Generic addresses (info@, contact@):** valid PIR recipients if on the district's
+  own domain. Not filtered out.
