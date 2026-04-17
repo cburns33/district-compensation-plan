@@ -93,6 +93,20 @@ NEWS_PENALTY_DOMAINS = [
 # CDN / document-hosting platforms used legitimately by school districts.
 # Files hosted here may live on a different registered domain than the
 # district homepage — that's expected and should NOT trigger WRONG DOMAIN.
+# URL path tokens that belong to specific large districts hosted on shared CDNs.
+# A Finalsite URL like /fwisdorg/... is Fort Worth ISD's document, not any district
+# whose search happens to return it. If a CDN URL contains one of these tokens, flag
+# as WRONG PATH even though the CDN domain itself is whitelisted.
+WRONG_CDN_PATHS = {
+    "fwisdorg",    # Fort Worth ISD Finalsite path
+    "houstonisd",  # Houston ISD Finalsite path
+    "dallasisd",   # Dallas ISD Finalsite path
+    "austinisd",   # Austin ISD Finalsite path
+    "saisd",       # San Antonio ISD Finalsite path
+    "aldine",      # Aldine ISD Finalsite path
+    "katyisd",     # Katy ISD Finalsite path (e.g. katyisdorg)
+}
+
 KNOWN_DOC_CDNS = {
     "finalsite.net",    # Finalsite — major school website/CDN platform
     "thrillshare.com",  # Thrillshare — school communications platform
@@ -876,9 +890,9 @@ def main():
         rows_to_process = err_rows
         logger.info("--rerun-error: %d Error/REVIEW rows to re-search", len(rows_to_process))
 
-    # --rerun-wrong-domain: rows already flagged "⚠ WRONG DOMAIN" OR rows whose
-    # current Best_URL (col J) lives on a domain that doesn't match the district
-    # homepage and isn't a known CDN — catches rows written before the guard existed.
+    # --rerun-wrong-domain: rows already flagged "⚠ WRONG DOMAIN" / "⚠ WRONG PATH",
+    # OR rows whose current Best_URL has a domain mismatch or CDN path contamination
+    # that slipped through before the guards existed.
     if args.rerun_wrong_domain:
         wd_rows = []
         for r in rows_to_process:
@@ -887,22 +901,29 @@ def main():
             best_url   = rd[COL_BEST_URL - 1].strip()  if len(rd) >= COL_BEST_URL  else ""
             homepage   = rd[COL_HOMEPAGE - 1].strip()   if len(rd) >= COL_HOMEPAGE  else ""
 
-            if qa == "\u26a0 WRONG DOMAIN":
+            if qa in ("\u26a0 WRONG DOMAIN", "\u26a0 WRONG PATH"):
                 wd_rows.append(r)
                 continue
 
-            # Also catch rows whose URL has a domain mismatch that slipped through
-            # before the guard was in place (they still show ✓ PDF / ✓ HTML).
             if best_url and best_url not in ("NO_RESULT", "API_ERROR") and homepage:
+                # Domain mismatch on non-CDN URLs
                 home_reg   = tldextract.extract(homepage).registered_domain
                 best_reg   = tldextract.extract(best_url).registered_domain
                 if (home_reg and best_reg
                         and best_reg != home_reg
                         and best_reg not in KNOWN_DOC_CDNS):
                     wd_rows.append(r)
+                    continue
+
+                # CDN path contamination: CDN domain is allowed but URL path is another district's
+                url_lower = best_url.lower()
+                for bad_path in WRONG_CDN_PATHS:
+                    if bad_path in url_lower:
+                        wd_rows.append(r)
+                        break
 
         rows_to_process = wd_rows
-        logger.info("--rerun-wrong-domain: %d domain-mismatch rows to re-search", len(rows_to_process))
+        logger.info("--rerun-wrong-domain: %d wrong-domain/path rows to re-search", len(rows_to_process))
 
     rerun_mode = any([args.rerun_html, args.rerun_dead, args.rerun_wrongdoc, args.rerun_error, args.rerun_wrong_domain])
 
@@ -1067,6 +1088,18 @@ def main():
                     sheet_row, final_best_domain, home_domain,
                 )
                 qa_status = "⚠ WRONG DOMAIN"
+            elif final_best_domain and final_best_domain in KNOWN_DOC_CDNS:
+                # CDN domain is allowed — but check that the URL path isn't for a
+                # different district (e.g. Finalsite /fwisdorg/ path for any non-FWISD row).
+                url_lower = best_url.lower()
+                for bad_path in WRONG_CDN_PATHS:
+                    if bad_path in url_lower:
+                        logger.warning(
+                            "Row %d | CDN path mismatch: URL contains '%s' (another district's path) — flagging as WRONG PATH",
+                            sheet_row, bad_path,
+                        )
+                        qa_status = "⚠ WRONG PATH"
+                        break
 
         logger.info("Row %d | QA: %s | time=%.1fs", sheet_row, qa_status, time.time() - row_start)
 
