@@ -369,6 +369,71 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
         return ""
 
 
+def crawl_homepage_deep(homepage_url: str, logger: logging.Logger) -> str:
+    """
+    Two-level crawl for Tier-4. First looks for direct PDF/XLSX links on the
+    homepage. If none found, follows HTML links whose text matches salary keywords
+    one level deeper and looks for PDF/XLSX links there.
+    Returns the best document URL found, or '' if nothing detected.
+    """
+    try:
+        resp = requests.get(
+            homepage_url, timeout=8,
+            headers={"User-Agent": QA_USER_AGENT},
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        doc_hits  = []
+        html_hits = []
+
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"].strip()
+            if not href or href.startswith(("mailto:", "tel:", "#")):
+                continue
+            full_url = urljoin(homepage_url, href)
+            result_domain = tldextract.extract(full_url).registered_domain or ""
+            if any(bad in result_domain for bad in NEWS_PENALTY_DOMAINS):
+                continue
+            text     = tag.get_text(" ", strip=True)
+            combined = f"{href} {text}"
+            if not SALARY_LINK_RE.search(combined):
+                continue
+            if DOC_EXT_RE.search(href):
+                doc_hits.append(full_url)
+            else:
+                html_hits.append(full_url)
+
+        if doc_hits:
+            logger.info("Tier-4 crawl found doc on homepage → %s", doc_hits[0])
+            return doc_hits[0]
+
+        # Follow salary HTML links one level deeper.
+        # Some links use short URLs (5il.co, etc.) that redirect directly to a PDF
+        # without a .pdf extension — HEAD-check first before crawling as HTML.
+        for html_url in html_hits[:3]:
+            try:
+                head = requests.head(html_url, timeout=6, allow_redirects=True,
+                                     headers={"User-Agent": QA_USER_AGENT})
+                ct = head.headers.get("Content-Type", "").lower()
+                if "pdf" in ct:
+                    logger.info("Tier-4 followed short URL to PDF → %s", head.url)
+                    return head.url
+            except Exception:
+                pass
+            deeper = crawl_html_for_salary_doc(html_url, logger)
+            if deeper:
+                return deeper
+
+        return ""
+
+    except Exception as exc:
+        logger.warning("Tier-4 homepage crawl error for %s: %s", homepage_url, exc)
+        return ""
+
+
 # ── Tier-1.5 year-free fallback search ───────────────────────────────────────
 
 def call_serper_noyear(district_name: str, serper_key: str, brave_key: str, tavily_key: str,
@@ -378,7 +443,7 @@ def call_serper_noyear(district_name: str, serper_key: str, brave_key: str, tavi
     year-qualified search scores <= FALLBACK_SCORE_THRESHOLD, which happens
     for small districts whose content isn't year-tagged.
     """
-    query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan" filetype:pdf'
+    query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan"'
     logger.info("Tier-1.5 year-free fallback: %s", query)
     try:
         return call_search(query, serper_key, brave_key, tavily_key, primary, logger, google_cse_key)
@@ -399,7 +464,7 @@ def call_serper_domain(homepage_url: str, serper_key: str, brave_key: str, tavil
     domain = tldextract.extract(homepage_url).registered_domain
     if not domain:
         return []
-    query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan" filetype:pdf'
+    query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan"'
     logger.info("Tier-3 domain search: %s", query)
     try:
         return call_search(query, serper_key, brave_key, tavily_key, primary, logger, google_cse_key)
@@ -1099,7 +1164,7 @@ def main():
         rows_to_process = wd_rows
         logger.info("--rerun-wrong-domain: %d wrong-domain/path rows to re-search", len(rows_to_process))
 
-    rerun_mode = any([args.rerun_html, args.rerun_dead, args.rerun_wrongdoc, args.rerun_error, args.rerun_wrong_domain])
+    rerun_mode = any([args.rerun_html, args.rerun_dead, args.rerun_wrongdoc, args.rerun_error, args.rerun_wrong_domain, bool(args.rows)])
 
     batch_buffer       = []
     rerun_rows_written = []   # rows re-searched; col P cleared after main loop
@@ -1139,7 +1204,7 @@ def main():
                 query = f'"{district_name}" filetype:pdf "salary schedule" OR "compensation plan" 2026'
             logger.info("Row %d | %s | HTML rerun query: %s", sheet_row, district_name, query)
         else:
-            query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26" filetype:pdf'
+            query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"'
             logger.info("Row %d | %s | Query: %s", sheet_row, district_name, query)
 
         # ── Serper call ───────────────────────────────────────────────────────
@@ -1220,7 +1285,13 @@ def main():
         # ── Tier-3: domain-scoped search if winner is on wrong domain ─────────
         home_domain = tldextract.extract(homepage_url).registered_domain if homepage_url else ""
         best_domain = tldextract.extract(best_url).registered_domain if best_url not in ("NO_RESULT", "API_ERROR") else ""
-        if home_domain and best_domain and best_domain != home_domain:
+        # CDN-hosted docs are expected to live on a different domain — don't
+        # fire Tier-3 unless the CDN URL contains a wrong-district path token.
+        _best_url_lower = best_url.lower()
+        _is_wrong_cdn = best_domain in KNOWN_DOC_CDNS and any(t in _best_url_lower for t in WRONG_CDN_PATHS)
+        _is_wrong_domain = home_domain and best_domain and best_domain != home_domain and best_domain not in KNOWN_DOC_CDNS
+        t3_upgraded = False
+        if _is_wrong_cdn or _is_wrong_domain:
             logger.info(
                 "Row %d | Tier-3: domain mismatch (%s ≠ %s), running site search",
                 sheet_row, best_domain, home_domain,
@@ -1235,11 +1306,16 @@ def main():
                 t3_scored.append((r["link"], si))
             if t3_scored:
                 t3_url, t3_score = max(t3_scored, key=lambda x: x[1])
-                if t3_score >= best_score:  # upgrade if Tier-3 is at least as good
+                # If Tier-3 fired because the current best is a confirmed wrong-district
+                # CDN document, accept any positive result from the right domain — a
+                # lower-scoring result on the correct domain beats a wrong-district PDF.
+                t3_threshold = 1 if _is_wrong_cdn else best_score
+                if t3_score >= t3_threshold:
                     logger.info("Row %d | Tier-3 upgraded: %s (%dpts)", sheet_row, t3_url, t3_score)
-                    best_url   = t3_url
-                    best_label = f"T3:{t3_score}pts +domain"
-                    qa_status  = qa_check(best_url, logger)
+                    best_url    = t3_url
+                    best_label  = f"T3:{t3_score}pts +domain"
+                    qa_status   = qa_check(best_url, logger)
+                    t3_upgraded = True
                     # Tier-2 crawl on Tier-3 result if HTML
                     if qa_status == "✓ HTML":
                         crawled = crawl_html_for_salary_doc(best_url, logger)
@@ -1247,6 +1323,20 @@ def main():
                             best_url   = crawled
                             best_label = best_label + " +crawl"
                             qa_status  = qa_check(best_url, logger)
+
+        # ── Tier-4: crawl homepage directly if Tier-3 found nothing ──────────────
+        # Fires when the current best is a wrong-district CDN document AND Tier-3
+        # couldn't find a replacement (Brave's site: search returned empty or
+        # contaminated results). The district homepage URL is already known.
+        if _is_wrong_cdn and not t3_upgraded and homepage_url:
+            hp_url = homepage_url if homepage_url.startswith("http") else f"https://{homepage_url}"
+            logger.info("Row %d | Tier-4: crawling homepage directly: %s", sheet_row, hp_url)
+            crawled = crawl_homepage_deep(hp_url, logger)
+            if crawled:
+                best_url   = crawled
+                best_label = best_label + " +hp"
+                qa_status  = qa_check(best_url, logger)
+                logger.info("Row %d | Tier-4 upgraded: %s", sheet_row, best_url)
 
         # ── Domain mismatch guard ─────────────────────────────────────────────
         # Flag if best URL is on an unrecognized third-party domain that doesn't
