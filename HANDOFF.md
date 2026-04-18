@@ -9,9 +9,10 @@
 
 Three parallel tracks:
 
-1. **Phase 1 (COMPLETE)** — Search Google/Brave for each of ~895 Texas school
-   district compensation plan URLs. Score, QA-check, classify, and write results
-   to the **Unique Districts** tab of a Google Sheet.
+1. **Phase 1 (RERUN IN PROGRESS)** — Search for each of ~895 Texas school district
+   compensation plan URLs. Score, QA-check, classify, and write results to the
+   **Unique Districts** tab of a Google Sheet. A full rerun is underway using an
+   improved scoring model (see Scoring Model section below).
 
 2. **Phase 2 (IN DESIGN)** — Extract full step/lane salary matrices from found
    documents into a normalized database. Target output feeds two products:
@@ -33,8 +34,12 @@ Three parallel tracks:
 
 `.env` file in project root (never committed):
 ```
-SERPER_API_KEY=...
-BRAVE_API_KEY=...
+SERPER_API_KEY=...          # depleted — do not set as primary
+BRAVE_API_KEY=...           # active primary; $10/month spend cap
+SEARCH_BACKEND=brave        # active backend: brave | serper | tavily | google
+TAVILY_API_KEY=...          # fallback; 1,000 free credits/month
+GOOGLE_CSE_KEY=...          # present but not viable (see Search Backends section)
+GOOGLE_CSE_CX=...           # present but not viable
 GOOGLE_SHEETS_CREDS_JSON=district-compensation-search-e9f9f750566f.json
 SPREADSHEET_ID=...
 GMAIL_CREDENTIALS_JSON=gmail-api.json
@@ -63,6 +68,7 @@ district-compensation-plan/
 ├── search_urls.py              # Phase 1: URL search — writes cols F–O
 ├── classify_documents.py       # Phase 1: document classification — writes cols P–S
 ├── qa_pipeline.py              # Phase 1: orchestrated QA cleanup (run after any bulk search)
+├── prepare_rerun.py            # Phase 1: pre-flight for full rerun — duplicates tab, clears cols, suggests test rows
 ├── remediate.py                # Phase 1: one-time fix script — COMPLETE, do not re-run
 ├── find_pio_contacts.py        # PIR Track: PIO email discovery — COMPLETE
 ├── send_pir.py                 # PIR Track: send PIR emails — all 196 sent
@@ -83,7 +89,7 @@ district-compensation-plan/
 
 ---
 
-## Phase 1 — URL Search + Classification (COMPLETE)
+## Phase 1 — URL Search + Classification (RERUN IN PROGRESS)
 
 ### Google Sheet: "Unique Districts" tab
 
@@ -112,28 +118,90 @@ district-compensation-plan/
 Scripts write only their allowed column ranges. Column guard enforced in code — any write
 outside the allowed range raises `RuntimeError` and halts.
 
-### Current Doc_Class Breakdown (as of 2026-04-16)
+### Doc_Class Breakdown (pre-rerun, as of 2026-04-16)
 
 | Doc_Class | Count | Notes |
 |-----------|-------|-------|
 | Complex | 269 | >15 pages or dense multi-table structure |
 | Simple | 161 | ≤3 pages, salary keywords found |
 | Medium | 60 | 4–15 pages |
-| Skipped | 350 | No valid URL (WRONG DOMAIN, WRONG PATH, DEAD, etc.) |
+| Skipped | ~373 | No valid URL (WRONG DOMAIN, WRONG PATH, DEAD, etc.) |
 | Unreadable | 27 | Scanned PDFs — no extractable text |
 | HTML | 17 | HTML pages, no downloadable doc found |
 | Error | 4 | Corrupt or oversized PDFs |
 | Blank | 8 | ⚠ REVIEW with no URL — small rural districts, in PIR bucket |
 
-490 districts have real classified documents. 350 districts have no findable comp plan
-online — most are in the PIR bucket or are tiny rural districts that don't publish online.
+Counts are from the pre-rerun pass. A full rerun with improved scoring is underway;
+these numbers will change.
+
+### Full Rerun Workflow
+
+A full clean rerun was triggered by two issues discovered in analysis:
+1. The old scoring model awarded 7pts to any PDF on the right domain — handbooks
+   scored identically to salary schedules. 27% of "high-confidence" rows had wrong docs.
+2. Multiple corruption passes from CDN path filter bugs left large-district rows with
+   incorrect documents.
+
+**Steps:**
+```bash
+# 1. Duplicate tab as backup, clear cols F–O, get 20 test row suggestions
+python prepare_rerun.py
+
+# 2. Test the new scoring model on those 20 rows
+python search_urls.py --rows <rows from step 1>
+
+# 3. Review results in the sheet. If good, run the full rerun:
+python search_urls.py
+
+# 4. After the full run completes, re-classify all rows:
+python classify_documents.py
+
+# 5. QA cleanup pass:
+python qa_pipeline.py
+```
+
+### Search Backends
+
+| Backend | Status | Cost |
+|---------|--------|------|
+| Brave | **Active primary** | ~$3–5/1,000 queries; $10/month cap set |
+| Tavily | Auto-fallback | 1,000 free credits/month |
+| Serper | Depleted | $50 minimum purchase; reserve for emergency reruns |
+| Google CSE | Not viable | "Search entire web" feature deprecated Jan 2026 — site-restricted only |
+
+The circuit breaker in `call_search()` automatically trips depleted backends for the
+lifetime of the process — no wasted retries on quota errors.
+
+### Scoring Model (as of 2026-04-17)
+
+Rewritten to use filename as the primary signal rather than the full URL+title+snippet.
+
+| Signal | Points | Notes |
+|--------|--------|-------|
+| PDF or XLSX file type | +3 | |
+| Domain match (homepage vs result) | +2 | |
+| Year pattern (2026, 25-26, etc.) | +2 | |
+| Compensation keyword in **filename** | +2 | salary, compensation, pay_scale, matrix, etc. |
+| Compensation keyword in title/snippet | +1 | Only if filename didn't fire |
+| News/social domain | -2 | reddit, indeed, linkedin, local news, etc. |
+| Scribd URL | -3 | Documents gated behind login |
+| Wrong-doc keyword in **filename** | -3 | handbook, budget, cafr, agenda, minutes, etc. |
+| Wrong-doc keyword in title/snippet | -2 | Weaker signal; only fires if filename didn't |
+
+All queries now include `filetype:pdf` to filter at the search layer before scoring.
+
+**Why this matters:** the old model gave 7pts (pdf+domain+year) to any PDF on the
+right domain. Handbooks and salary schedules scored identically. The new model
+separates them by 5+ points when the filename keyword fires.
 
 ### Search History
 
 - All ~895 rows processed via search_urls.py (multiple passes over several sessions).
 - `remediate.py` was run once to fix 38 failed rows (DEAD/TIMEOUT/REVIEW) — do not re-run.
 - Multiple QA cleanup passes were run to fix wrong-domain and CDN-path contamination.
-- See "QA Cleanup" section below for the current process.
+- CDN path filter bug caused ~179 large-district rows to be corrupted; Tavily recovery
+  was partial. Full rerun with Brave is the fix.
+- See "QA Cleanup" section below for the ongoing process.
 
 ---
 
@@ -393,14 +461,15 @@ meaningful for complex ones.
 
 ## Important Behavioral Notes
 
-- **Never re-run search_urls.py on all rows.** The full search run is complete. Use
-  `qa_pipeline.py` or individual `--rerun-*` flags for targeted cleanup only.
+- **Full reruns are intentional** — use `prepare_rerun.py` first to back up the tab
+  and get test row suggestions. Always test ~20 rows before committing to all ~895.
 - **Never re-run remediate.py.** It was a one-time fix pass.
 - **Never run find_pio_contacts.py on all rows.** Discovery is complete.
 - **All 196 PIR emails are sent.** Never run `send_pir.py` without `--district-number`
   and `--force` unless adding genuinely new districts.
-- **Serper/Brave credits cost money.** Always use `--dry-run` before a live run. The
+- **Search credits cost money.** Always use `--dry-run` before a live run. The
   `qa_pipeline.py --dry-run` flag previews all passes without any API calls.
+  Brave is the active backend ($10/month cap). Serper is depleted — do not set as primary.
 - **Column safety guards** are enforced in every script. Any write outside the allowed
   range raises `RuntimeError` and halts.
 - **Windows UTF-8:** all scripts have a stdout/stderr wrapper to handle Unicode symbols

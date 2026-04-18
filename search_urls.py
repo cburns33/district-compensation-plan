@@ -71,8 +71,9 @@ HEADERS_ROW = [
     "Search_Method", "QA_Status", "Redirect_URL",
 ]
 
-SERPER_ENDPOINT = "https://google.serper.dev/search"
-TAVILY_ENDPOINT = "https://api.tavily.com/search"
+SERPER_ENDPOINT  = "https://google.serper.dev/search"
+TAVILY_ENDPOINT  = "https://api.tavily.com/search"
+GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 RATE_LIMIT_SLEEP = 1.5   # seconds between Serper calls
 RETRY_SLEEP      = 4.0   # seconds before retrying a failed Serper call
 QA_TIMEOUT       = 6     # seconds for HEAD request
@@ -181,13 +182,17 @@ def score_result(url: str, title: str, snippet: str, homepage_url: str):
     reasons = []
     combined = f"{url} {title} {snippet}"
 
+    # Extract filename from URL for targeted checks (strip query string first)
+    url_path = url.lower().split("?")[0]
+    filename = url_path.rsplit("/", 1)[-1]
+
     # +3 file type
     if re.search(r'\.(pdf|xlsx)(\?.*)?$', url, re.IGNORECASE):
         score += 3
-        reasons.append("+3 PDF/XLSX file type")
+        reasons.append("+3 PDF/XLSX")
 
     # +2 domain match
-    home_reg  = tldextract.extract(homepage_url).registered_domain
+    home_reg   = tldextract.extract(homepage_url).registered_domain
     result_reg = tldextract.extract(url).registered_domain
     if home_reg and result_reg and home_reg == result_reg:
         score += 2
@@ -196,34 +201,53 @@ def score_result(url: str, title: str, snippet: str, homepage_url: str):
     # +2 year pattern
     if re.search(r'2026|2025-26|25-26|2026-27|26-27', combined):
         score += 2
-        reasons.append("+2 year pattern matched")
+        reasons.append("+2 year")
 
-    # +1 compensation keyword
-    if re.search(
-        r'compensation|salary|pay\s+plan|pay\s+scale|pay\s+schedule|wage',
-        combined, re.IGNORECASE
-    ):
+    # +2 compensation keyword in filename — strongest positive signal
+    # +1 keyword anywhere in URL/title/snippet — weaker fallback
+    _COMP_KEYWORD_RE = re.compile(
+        r'compensation|salary|pay.?scale|pay.?plan|pay.?plans|pay.?schedule'
+        r'|pay.?grade|wage|matrix',
+        re.IGNORECASE,
+    )
+    if _COMP_KEYWORD_RE.search(filename):
+        score += 2
+        reasons.append("+2 keyword in filename")
+    elif _COMP_KEYWORD_RE.search(combined):
         score += 1
-        reasons.append("+1 compensation keyword")
+        reasons.append("+1 keyword in result")
 
-    # -2 news/social penalty (first match only)
+    # -2 news/social penalty
     url_lower = url.lower()
     for bad in NEWS_PENALTY_DOMAINS:
         if bad in url_lower:
             score -= 2
-            reasons.append(f"-2 news/social penalty ({bad})")
+            reasons.append(f"-2 news/social ({bad})")
             break
 
-    # -3 wrong-doc penalty — clearly non-salary documents
+    # -3 Scribd — documents are gated behind login/paywall
+    if "scribd.com" in url_lower:
+        score -= 3
+        reasons.append("-3 Scribd")
+
+    # -3 wrong-doc filename — unambiguous negative signal
     if re.search(
+        r'handbook|budget|cafr|agenda|minutes|student.?guide|parent.?guide'
+        r'|code.?of.?conduct|benefits.?guide|policy.?manual',
+        filename, re.IGNORECASE
+    ):
+        score -= 3
+        reasons.append("-3 wrong-doc filename")
+    # -2 wrong-doc in title/snippet — weaker signal
+    elif re.search(
         r'handbook|board.?trustee|trustee.?handbook|policy.?manual|staff.?handbook'
         r'|employee.?handbook|improvement.?plan|strategic.?plan|bond.?election'
         r'|election.?order|annual.?report|financial.?report|budget.?doc|audit.?report'
         r'|wellness|benefits.?guide|code.?of.?conduct|parent.?guide|student.?handbook',
         combined, re.IGNORECASE
     ):
-        score -= 3
-        reasons.append("-3 wrong-doc penalty (handbook/policy/report)")
+        score -= 2
+        reasons.append("-2 wrong-doc in title/snippet")
 
     return score, reasons
 
@@ -294,7 +318,7 @@ def qa_check(url: str, logger: logging.Logger) -> str:
 # ── Tier-2 HTML crawl ────────────────────────────────────────────────────────
 
 SALARY_LINK_RE = re.compile(
-    r'compensation|salary|pay.?scale|pay.?plan|pay.?schedule|wage',
+    r'compensation|salary|pay.?scale|pay.?plan|pay.?plans|pay.?schedule|pay.?grade|wage|matrix',
     re.IGNORECASE,
 )
 DOC_EXT_RE = re.compile(r'\.(pdf|xlsx|xls|docx)(\?.*)?$', re.IGNORECASE)
@@ -316,8 +340,7 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
             return ""
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        doc_hits  = []  # links to PDF/XLSX/etc. with salary keywords
-        html_hits = []  # plain HTML links with salary keywords
+        doc_hits = []  # PDF/XLSX links with salary keywords
 
         for tag in soup.find_all("a", href=True):
             href = tag["href"].strip()
@@ -335,15 +358,10 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
                 continue
             if DOC_EXT_RE.search(href):
                 doc_hits.append(full_url)
-            else:
-                html_hits.append(full_url)
 
         if doc_hits:
             logger.info("Crawl found %d doc link(s) on %s → %s", len(doc_hits), page_url, doc_hits[0])
             return doc_hits[0]
-        if html_hits:
-            logger.info("Crawl found %d HTML link(s) on %s → %s", len(html_hits), page_url, html_hits[0])
-            return html_hits[0]
         return ""
 
     except Exception as exc:
@@ -354,16 +372,16 @@ def crawl_html_for_salary_doc(page_url: str, logger: logging.Logger) -> str:
 # ── Tier-1.5 year-free fallback search ───────────────────────────────────────
 
 def call_serper_noyear(district_name: str, serper_key: str, brave_key: str, tavily_key: str,
-                       logger: logging.Logger, primary: str = "serper"):
+                       logger: logging.Logger, primary: str = "serper", google_cse_key: str = ""):
     """
     Fallback query without any year qualifier. Used when the primary
     year-qualified search scores <= FALLBACK_SCORE_THRESHOLD, which happens
     for small districts whose content isn't year-tagged.
     """
-    query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan"'
+    query = f'{district_name} "pay scale" OR "salary schedule" OR "compensation plan" filetype:pdf'
     logger.info("Tier-1.5 year-free fallback: %s", query)
     try:
-        return call_search(query, serper_key, brave_key, tavily_key, primary, logger)
+        return call_search(query, serper_key, brave_key, tavily_key, primary, logger, google_cse_key)
     except Exception as exc:
         logger.warning("Tier-1.5 fallback failed: %s", exc)
         return []
@@ -372,7 +390,7 @@ def call_serper_noyear(district_name: str, serper_key: str, brave_key: str, tavi
 # ── Tier-3 domain-scoped search ───────────────────────────────────────────────
 
 def call_serper_domain(homepage_url: str, serper_key: str, brave_key: str, tavily_key: str,
-                       logger: logging.Logger, primary: str = "serper"):
+                       logger: logging.Logger, primary: str = "serper", google_cse_key: str = ""):
     """
     Tier-3: fire a site:-scoped query restricted to the district's own domain.
     Used when the primary search winner lands on the wrong district's domain.
@@ -381,10 +399,10 @@ def call_serper_domain(homepage_url: str, serper_key: str, brave_key: str, tavil
     domain = tldextract.extract(homepage_url).registered_domain
     if not domain:
         return []
-    query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan"'
+    query = f'site:{domain} "pay scale" OR "salary schedule" OR "compensation plan" filetype:pdf'
     logger.info("Tier-3 domain search: %s", query)
     try:
-        return call_search(query, serper_key, brave_key, tavily_key, primary, logger)
+        return call_search(query, serper_key, brave_key, tavily_key, primary, logger, google_cse_key)
     except Exception as exc:
         logger.warning("Tier-3 search failed: %s", exc)
         return []
@@ -478,20 +496,73 @@ def call_tavily(query: str, api_key: str, logger: logging.Logger):
                 raise
 
 
+def call_google_cse(query: str, key_cx: str, logger: logging.Logger):
+    """
+    Call Google Custom Search JSON API. key_cx must be 'API_KEY|CX_ID'.
+    Returns up to 10 results with keys: link, title, snippet.
+    """
+    api_key, cx = key_cx.split("|", 1)
+    params = {"key": api_key, "cx": cx, "q": query, "num": 10}
+
+    for attempt in range(2):
+        try:
+            resp = requests.get(GOOGLE_CSE_ENDPOINT, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            results = []
+            for item in (data.get("items", []))[:10]:
+                results.append({
+                    "link":    item.get("link", "NO_RESULT"),
+                    "title":   item.get("title", ""),
+                    "snippet": item.get("snippet", ""),
+                })
+            return results
+        except Exception as exc:
+            logger.warning("Google CSE attempt %d failed: %s", attempt + 1, exc)
+            if attempt == 0:
+                time.sleep(RETRY_SLEEP)
+            else:
+                raise
+
+
+# Backends that have hit a quota/auth error this process run are added here and
+# skipped on all subsequent calls — no point retrying a depleted API.
+_tripped_backends: set[str] = set()
+
+# HTTP status codes that indicate a quota or auth failure (not a transient error)
+_QUOTA_STATUSES = {400, 401, 402, 403}
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Return True if the exception looks like a quota or auth failure."""
+    msg = str(exc)
+    if any(str(s) in msg for s in _QUOTA_STATUSES):
+        return True
+    if "Not enough credits" in msg or "Payment Required" in msg:
+        return True
+    return False
+
+
 def call_search(query: str, serper_key: str, brave_key: str, tavily_key: str,
-                primary: str, logger: logging.Logger):
+                primary: str, logger: logging.Logger, google_cse_key: str = ""):
     """
     Try the primary backend first, then fall back through the others if it
-    fails. Raises only if every configured backend is exhausted.
+    fails. Backends that have hit a quota error are circuit-broken for the
+    lifetime of this process. Raises only if every configured backend is
+    exhausted.
     """
     all_backends = [
-        ("serper", call_serper, serper_key),
-        ("brave",  call_brave,  brave_key),
-        ("tavily", call_tavily, tavily_key),
+        ("serper", call_serper,     serper_key),
+        ("brave",  call_brave,      brave_key),
+        ("google", call_google_cse, google_cse_key),
+        ("tavily", call_tavily,     tavily_key),
     ]
-    # Primary first, then the rest in default order; skip unconfigured
-    order = [b for b in all_backends if b[0] == primary and b[2]]
-    order += [b for b in all_backends if b[0] != primary and b[2]]
+    # Primary first, then the rest in default order; skip unconfigured or tripped
+    order = [b for b in all_backends if b[0] == primary and b[2] and b[0] not in _tripped_backends]
+    order += [b for b in all_backends if b[0] != primary and b[2] and b[0] not in _tripped_backends]
+
+    if not order:
+        raise RuntimeError("All search backends are depleted or unconfigured")
 
     last_exc: Exception = RuntimeError("No search backends configured")
     for i, (name, fn, key) in enumerate(order):
@@ -499,7 +570,10 @@ def call_search(query: str, serper_key: str, brave_key: str, tavily_key: str,
             return fn(query, key, logger)
         except Exception as exc:
             last_exc = exc
-            if i < len(order) - 1:
+            if _is_quota_error(exc):
+                _tripped_backends.add(name)
+                logger.warning("Backend '%s' quota exhausted — disabling for this run", name)
+            elif i < len(order) - 1:
                 logger.warning("Backend '%s' failed (%s) — trying next backend", name, exc)
     raise last_exc
 
@@ -574,15 +648,27 @@ def ensure_headers(sheet) -> None:
 
 
 def flush_batch(sheet, buffer: list) -> None:
-    """Write accumulated rows to the sheet in one batch_update call."""
+    """Write accumulated rows to the sheet in one batch_update call, with retries."""
     if not buffer:
         return
     data = []
     for item in buffer:
         cell_range = _row_range(item["row"])
         data.append({"range": cell_range, "values": [item["values"]]})
-    sheet.batch_update(data, value_input_option="USER_ENTERED")
-    buffer.clear()
+    for attempt in range(3):
+        try:
+            sheet.batch_update(data, value_input_option="USER_ENTERED")
+            buffer.clear()
+            return
+        except Exception as exc:
+            if attempt < 2:
+                wait = 10 * (attempt + 1)
+                logging.getLogger(__name__).warning(
+                    "Sheets write attempt %d failed (%s) — retrying in %ds", attempt + 1, exc, wait
+                )
+                time.sleep(wait)
+            else:
+                raise
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -798,6 +884,10 @@ def parse_args():
         "--rerun-wrong-domain", action="store_true",
         help="Re-search rows where QA_Status (col N) is '⚠ WRONG DOMAIN'",
     )
+    parser.add_argument(
+        "--rows", type=str, default=None,
+        help="Comma-separated list of specific sheet row numbers to process (e.g. 15,42,100)",
+    )
     return parser.parse_args()
 
 
@@ -851,10 +941,14 @@ def main():
 
     # ── Credentials ───────────────────────────────────────────────────────────
     load_dotenv()
-    search_backend = os.environ.get("SEARCH_BACKEND", "serper").strip().lower()
-    serper_key     = os.environ.get("SERPER_API_KEY", "").strip()
-    brave_key      = os.environ.get("BRAVE_API_KEY", "").strip()
-    tavily_key     = os.environ.get("TAVILY_API_KEY", "").strip()
+    search_backend  = os.environ.get("SEARCH_BACKEND", "serper").strip().lower()
+    serper_key      = os.environ.get("SERPER_API_KEY", "").strip()
+    brave_key       = os.environ.get("BRAVE_API_KEY", "").strip()
+    tavily_key      = os.environ.get("TAVILY_API_KEY", "").strip()
+    google_cse_api  = os.environ.get("GOOGLE_CSE_KEY", "").strip()
+    google_cse_cx   = os.environ.get("GOOGLE_CSE_CX", "").strip()
+    # Combine into single token for call_google_cse; empty string disables backend
+    google_cse_key  = f"{google_cse_api}|{google_cse_cx}" if google_cse_api and google_cse_cx else ""
     creds_path_raw = os.environ.get("GOOGLE_SHEETS_CREDS_JSON", "").strip()
     # Resolve relative paths from the project directory so .env is portable
     # across machines (Mac, Windows) regardless of absolute folder locations.
@@ -865,10 +959,10 @@ def main():
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
 
     missing = []
-    if not any([serper_key, brave_key, tavily_key]):
-        missing.append("at least one of SERPER_API_KEY / BRAVE_API_KEY / TAVILY_API_KEY")
-    elif search_backend not in ("serper", "brave", "tavily"):
-        missing.append(f"SEARCH_BACKEND must be serper, brave, or tavily (got '{search_backend}')")
+    if not any([serper_key, brave_key, tavily_key, google_cse_key]):
+        missing.append("at least one of SERPER_API_KEY / BRAVE_API_KEY / TAVILY_API_KEY / GOOGLE_CSE_KEY+GOOGLE_CSE_CX")
+    elif search_backend not in ("serper", "brave", "tavily", "google"):
+        missing.append(f"SEARCH_BACKEND must be serper, brave, tavily, or google (got '{search_backend}')")
     if not creds_path:     missing.append("GOOGLE_SHEETS_CREDS_JSON")
     if not spreadsheet_id: missing.append("SPREADSHEET_ID")
     if missing:
@@ -898,8 +992,16 @@ def main():
     end_row   = args.end_row if args.end_row else total_data_rows
     end_row   = min(end_row, total_data_rows)
 
+    # --rows: explicit comma-separated row list takes priority over everything
+    if args.rows:
+        try:
+            rows_to_process = sorted(set(int(r.strip()) for r in args.rows.split(",")))
+        except ValueError:
+            logger.error("--rows must be comma-separated integers (e.g. 15,42,100)")
+            sys.exit(1)
+        logger.info("--rows: %d specific rows selected", len(rows_to_process))
     # Build explicit row set when --first-n / --last-n are used
-    if args.first_n or args.last_n:
+    elif args.first_n or args.last_n:
         row_set = set()
         if args.first_n:
             first_end = min(start_row + args.first_n - 1, end_row)
@@ -1037,7 +1139,7 @@ def main():
                 query = f'"{district_name}" filetype:pdf "salary schedule" OR "compensation plan" 2026'
             logger.info("Row %d | %s | HTML rerun query: %s", sheet_row, district_name, query)
         else:
-            query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"'
+            query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26" filetype:pdf'
             logger.info("Row %d | %s | Query: %s", sheet_row, district_name, query)
 
         # ── Serper call ───────────────────────────────────────────────────────
@@ -1046,7 +1148,7 @@ def main():
         r1_snippet = r2_snippet = ""
 
         try:
-            results = call_search(query, serper_key, brave_key, tavily_key, search_backend, logger)
+            results = call_search(query, serper_key, brave_key, tavily_key, search_backend, logger, google_cse_key)
             results = _pad_results(results)
             r1_url, r1_title, r1_snippet = results[0]["link"], results[0]["title"], results[0]["snippet"]
             r2_url, r2_title, r2_snippet = results[1]["link"], results[1]["title"], results[1]["snippet"]
@@ -1087,7 +1189,7 @@ def main():
                 sheet_row, best_score, FALLBACK_SCORE_THRESHOLD,
             )
             time.sleep(RATE_LIMIT_SLEEP)
-            fb_results = call_serper_noyear(district_name, serper_key, brave_key, tavily_key, logger, search_backend)
+            fb_results = call_serper_noyear(district_name, serper_key, brave_key, tavily_key, logger, search_backend, google_cse_key)
             fb_results = _pad_results(fb_results)
             for r in fb_results:
                 if r["link"] in ("NO_RESULT", "API_ERROR"):
@@ -1123,7 +1225,7 @@ def main():
                 "Row %d | Tier-3: domain mismatch (%s ≠ %s), running site search",
                 sheet_row, best_domain, home_domain,
             )
-            t3_results = call_serper_domain(homepage_url, serper_key, brave_key, tavily_key, logger, search_backend)
+            t3_results = call_serper_domain(homepage_url, serper_key, brave_key, tavily_key, logger, search_backend, google_cse_key)
             t3_results = _pad_results(t3_results)
             t3_scored = []
             for r in t3_results:
