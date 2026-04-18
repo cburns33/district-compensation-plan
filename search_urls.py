@@ -230,6 +230,14 @@ def score_result(url: str, title: str, snippet: str, homepage_url: str):
         score -= 3
         reasons.append("-3 Scribd")
 
+    # -5 wrong-district CDN path — CDN URL with another district's path token
+    if result_reg in KNOWN_DOC_CDNS:
+        for bad_path in WRONG_CDN_PATHS:
+            if bad_path in url_lower:
+                score -= 5
+                reasons.append(f"-5 wrong CDN path ({bad_path})")
+                break
+
     # -3 wrong-doc filename — unambiguous negative signal
     if re.search(
         r'handbook|budget|cafr|agenda|minutes|student.?guide|parent.?guide'
@@ -588,6 +596,55 @@ def call_google_cse(query: str, key_cx: str, logger: logging.Logger):
                 time.sleep(RETRY_SLEEP)
             else:
                 raise
+
+
+def call_gemini_grounding(query: str, gemini_key: str, logger: logging.Logger):
+    """
+    Call Gemini 2.5-flash with Google Search grounding.
+    Returns results in standard {link, title, snippet} format.
+    Redirect URIs from groundingChunks are resolved to real URLs via HEAD request.
+    """
+    try:
+        import google.genai as genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError("google-genai not installed; run: pip install google-genai")
+
+    client = genai.Client(api_key=gemini_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=query,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
+    )
+    meta = response.candidates[0].grounding_metadata
+    chunks = meta.grounding_chunks or []
+
+    # Resolve redirect URLs in parallel to minimise latency
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _resolve(chunk):
+        uri = chunk.web.uri or ""
+        title = chunk.web.title or ""
+        if not uri:
+            return None
+        try:
+            r = requests.head(uri, timeout=6, allow_redirects=True,
+                              headers={"User-Agent": QA_USER_AGENT})
+            return {"link": r.url, "title": title, "snippet": ""}
+        except Exception:
+            return {"link": uri, "title": title, "snippet": ""}
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_resolve, c): c for c in chunks}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                results.append(res)
+
+    return results
 
 
 # Backends that have hit a quota/auth error this process run are added here and
@@ -1014,6 +1071,7 @@ def main():
     google_cse_cx   = os.environ.get("GOOGLE_CSE_CX", "").strip()
     # Combine into single token for call_google_cse; empty string disables backend
     google_cse_key  = f"{google_cse_api}|{google_cse_cx}" if google_cse_api and google_cse_cx else ""
+    gemini_key      = os.environ.get("GEMINI_API_KEY", "").strip()
     creds_path_raw = os.environ.get("GOOGLE_SHEETS_CREDS_JSON", "").strip()
     # Resolve relative paths from the project directory so .env is portable
     # across machines (Mac, Windows) regardless of absolute folder locations.
@@ -1207,7 +1265,7 @@ def main():
             query = f'{district_name} compensation plan OR "pay scale" OR "salary schedule" 2026 OR "25-26"'
             logger.info("Row %d | %s | Query: %s", sheet_row, district_name, query)
 
-        # ── Serper call ───────────────────────────────────────────────────────
+        # ── General search ────────────────────────────────────────────────────
         r1_url = r2_url = "API_ERROR"
         r1_title = r2_title = ""
         r1_snippet = r2_snippet = ""
@@ -1222,29 +1280,88 @@ def main():
             results = _pad_results([])
             r1_url = "API_ERROR"
 
-        # ── Scoring across all 10 results (fallback to R3–R10 automatically) ──
+        # ── Parallel site-scoped search (always when homepage is known) ───────
+        site_results = []
+        if homepage_url:
+            time.sleep(RATE_LIMIT_SLEEP)
+            try:
+                raw_site = call_serper_domain(homepage_url, serper_key, brave_key, tavily_key, logger, search_backend, google_cse_key)
+                site_results = [r for r in _pad_results(raw_site) if r["link"] not in ("NO_RESULT", "API_ERROR")]
+            except Exception as exc:
+                logger.warning("Row %d | Site search failed: %s", sheet_row, exc)
+
+        # ── Score all results (general R1–R10, site-scoped S1–S10) ──────────
         scored = []
         for i, r in enumerate(results, start=1):
             if r["link"] in ("NO_RESULT", "API_ERROR"):
-                scored.append((i, r["link"], 0, []))
+                scored.append((f"R{i}", r["link"], 0, []))
                 continue
             si, ri = score_result(r["link"], r["title"], r["snippet"], homepage_url)
-            scored.append((i, r["link"], si, ri))
+            scored.append((f"R{i}", r["link"], si, ri))
+
+        seen_urls = {r["link"] for r in results}
+        for i, r in enumerate(site_results, start=1):
+            if r["link"] in seen_urls:
+                continue
+            si, ri = score_result(r["link"], r["title"], r["snippet"], homepage_url)
+            scored.append((f"S{i}", r["link"], si, ri))
+            seen_urls.add(r["link"])
 
         s1, reasons1 = scored[0][2], scored[0][3]
         s2, reasons2 = scored[1][2], scored[1][3]
 
-        # Pick best: highest score, ties go to lowest result index
-        best_idx, best_url, best_score, _ = max(scored, key=lambda x: x[2])
-        if best_score > 0:
-            suffix = " +fallback" if best_idx > 2 else ""
-            best_label = f"R{best_idx}:{best_score}pts{suffix}"
+        home_domain = tldextract.extract(homepage_url).registered_domain if homepage_url else ""
+
+        # Pick best from Brave+site: prefer any right-domain result (score >= 0)
+        right_domain = [
+            (k, u, s, r) for k, u, s, r in scored
+            if home_domain and tldextract.extract(u).registered_domain == home_domain and s >= 0
+        ]
+
+        # ── Conditional Gemini: only fire when Brave+site found nothing from right domain ──
+        if gemini_key and "gemini" not in _tripped_backends and not right_domain:
+            try:
+                gemini_results = call_gemini_grounding(query, gemini_key, logger)
+                logger.info("Row %d | Gemini: %d chunks", sheet_row, len(gemini_results))
+                for i, r in enumerate(gemini_results, start=1):
+                    if r["link"] in seen_urls:
+                        continue
+                    si, ri = score_result(r["link"], r["title"], r["snippet"], homepage_url)
+                    scored.append((f"G{i}", r["link"], si, ri))
+                    seen_urls.add(r["link"])
+                # Re-check right_domain now that Gemini results are scored
+                right_domain = [
+                    (k, u, s, r) for k, u, s, r in scored
+                    if home_domain and tldextract.extract(u).registered_domain == home_domain and s >= 0
+                ]
+            except Exception as exc:
+                msg = str(exc)
+                if "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower() or "429" in msg or "billing" in msg.lower():
+                    logger.warning("Row %d | Gemini budget exhausted — disabling for remainder of run", sheet_row)
+                    _tripped_backends.add("gemini")
+                else:
+                    logger.warning("Row %d | Gemini grounding failed: %s", sheet_row, exc)
+
+        if right_domain:
+            best_key, best_url, best_score, _ = max(right_domain, key=lambda x: x[2])
         else:
-            best_label = f"R{best_idx}:0pts (no clear winner)"
+            best_key, best_url, best_score, _ = max(scored, key=lambda x: x[2])
+
+        if best_score > 0:
+            if best_key.startswith("G"):
+                best_label = f"{best_key}:{best_score}pts +gemini"
+            elif best_key.startswith("S"):
+                best_label = f"{best_key}:{best_score}pts +site"
+            elif best_key not in ("R1", "R2"):
+                best_label = f"{best_key}:{best_score}pts +fallback"
+            else:
+                best_label = f"{best_key}:{best_score}pts"
+        else:
+            best_label = f"{best_key}:0pts (no clear winner)"
 
         logger.info(
-            "Row %d | %s | R1=%dpts %s | R2=%dpts %s | Best=R%d:%dpts",
-            sheet_row, district_name, s1, reasons1, s2, reasons2, best_idx, best_score,
+            "Row %d | %s | R1=%dpts %s | R2=%dpts %s | Best=%s:%dpts",
+            sheet_row, district_name, s1, reasons1, s2, reasons2, best_key, best_score,
         )
 
         # ── Tier-1.5: year-free fallback if primary score is too low ──────────
@@ -1261,6 +1378,18 @@ def main():
                     continue
                 si, _ = score_result(r["link"], r["title"], r["snippet"], homepage_url)
                 if si > best_score:
+                    # Reject upgrades that would fail the domain check:
+                    # wrong non-CDN domain, or CDN whose path doesn't contain
+                    # this district's own identifier.
+                    r_domain = tldextract.extract(r["link"]).registered_domain
+                    if home_domain and r_domain != home_domain:
+                        if r_domain not in KNOWN_DOC_CDNS:
+                            continue  # wrong non-CDN domain — skip
+                        # CDN: verify the URL path contains the current district's
+                        # base name (e.g. 'sintonisd' must appear in the CDN path).
+                        home_base = tldextract.extract(home_domain).domain.lower()
+                        if home_base and len(home_base) >= 4 and home_base not in r["link"].lower():
+                            continue  # CDN path belongs to a different district — skip
                     logger.info(
                         "Row %d | Tier-1.5 upgraded: %s (%dpts > %dpts)",
                         sheet_row, r["link"], si, best_score,
@@ -1283,7 +1412,6 @@ def main():
                 qa_status  = qa_check(best_url, logger)
 
         # ── Tier-3: domain-scoped search if winner is on wrong domain ─────────
-        home_domain = tldextract.extract(homepage_url).registered_domain if homepage_url else ""
         best_domain = tldextract.extract(best_url).registered_domain if best_url not in ("NO_RESULT", "API_ERROR") else ""
         # CDN-hosted docs are expected to live on a different domain — don't
         # fire Tier-3 unless the CDN URL contains a wrong-district path token.
@@ -1291,7 +1419,7 @@ def main():
         _is_wrong_cdn = best_domain in KNOWN_DOC_CDNS and any(t in _best_url_lower for t in WRONG_CDN_PATHS)
         _is_wrong_domain = home_domain and best_domain and best_domain != home_domain and best_domain not in KNOWN_DOC_CDNS
         t3_upgraded = False
-        if _is_wrong_cdn or _is_wrong_domain:
+        if (_is_wrong_cdn or _is_wrong_domain) and not site_results:
             logger.info(
                 "Row %d | Tier-3: domain mismatch (%s ≠ %s), running site search",
                 sheet_row, best_domain, home_domain,
