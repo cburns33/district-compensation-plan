@@ -98,8 +98,8 @@ def search_homepage(district_name: str) -> str | None:
 
     if resp.status_code in (401, 403):
         raise RuntimeError("BRAVE_AUTH_ERROR")
-    if resp.status_code == 429:
-        raise RuntimeError("BRAVE_RATE_LIMIT")
+    if resp.status_code in (402, 429):
+        raise RuntimeError("BRAVE_QUOTA_EXCEEDED")
     if resp.status_code != 200:
         raise RuntimeError(f"BRAVE_HTTP_{resp.status_code}")
 
@@ -191,7 +191,7 @@ def main():
             found_url = search_homepage(district_name)
         except RuntimeError as exc:
             msg = str(exc)
-            if "AUTH" in msg or "RATE_LIMIT" in msg:
+            if "AUTH" in msg or "RATE_LIMIT" in msg or "QUOTA" in msg:
                 logger.error("Row %d | Brave budget/auth error (%s) — stopping", sheet_row, msg)
                 break
             logger.warning("Row %d | %s | search error: %s", sheet_row, district_name, exc)
