@@ -231,11 +231,18 @@ def score_result(url: str, title: str, snippet: str, homepage_url: str):
         reasons.append("-3 Scribd")
 
     # -5 wrong-district CDN path — CDN URL with another district's path token
+    # Skip the penalty if the token belongs to the district currently being searched.
+    # home_base is the registered domain stem (e.g. "houstonisd" from houstonisd.org,
+    # "fwisd" from fwisd.org). The CDN token may be "fwisdorg" so we check substring
+    # overlap in both directions.
     if result_reg in KNOWN_DOC_CDNS:
+        home_base = tldextract.extract(homepage_url).domain.lower() if homepage_url else ""
         for bad_path in WRONG_CDN_PATHS:
             if bad_path in url_lower:
-                score -= 5
-                reasons.append(f"-5 wrong CDN path ({bad_path})")
+                is_own_district = home_base and (home_base in bad_path or bad_path in home_base)
+                if not is_own_district:
+                    score -= 5
+                    reasons.append(f"-5 wrong CDN path ({bad_path})")
                 break
 
     # -3 wrong-doc filename — unambiguous negative signal
@@ -312,6 +319,17 @@ def qa_check(url: str, logger: logging.Logger) -> str:
         elif redirected:
             return f"⚠ REDIRECT → {final_url}"
         elif resp.status_code >= 400:
+            # Some servers reject HEAD with 4xx but serve GET fine — retry once
+            try:
+                gr = requests.get(url, timeout=QA_TIMEOUT, stream=True, headers=headers)
+                gr.close()
+                if gr.status_code < 400:
+                    ct2 = gr.headers.get("Content-Type", "").lower()
+                    if "pdf" in ct2:
+                        return "✓ PDF"
+                    return "✓ HTML"
+            except Exception:
+                pass
             return "✗ DEAD"
         else:
             return "⚠ REVIEW"
@@ -1311,11 +1329,25 @@ def main():
         s2, reasons2 = scored[1][2], scored[1][3]
 
         home_domain = tldextract.extract(homepage_url).registered_domain if homepage_url else ""
+        home_base = tldextract.extract(homepage_url).domain.lower() if homepage_url else ""
+
+        def _is_right_domain(url: str) -> bool:
+            """True if this URL belongs to the current district (direct or via own CDN)."""
+            rd = tldextract.extract(url).registered_domain
+            if rd == home_domain:
+                return True
+            # CDN URL whose path token matches this district (e.g. /houstonisd/ on Finalsite)
+            if rd in KNOWN_DOC_CDNS and home_base:
+                url_l = url.lower()
+                for token in WRONG_CDN_PATHS:
+                    if token in url_l and (home_base in token or token in home_base):
+                        return True
+            return False
 
         # Pick best from Brave+site: prefer any right-domain result (score >= 0)
         right_domain = [
             (k, u, s, r) for k, u, s, r in scored
-            if home_domain and tldextract.extract(u).registered_domain == home_domain and s >= 0
+            if home_domain and _is_right_domain(u) and s >= 0
         ]
 
         # ── Conditional Gemini: only fire when Brave+site found nothing from right domain ──
@@ -1332,7 +1364,7 @@ def main():
                 # Re-check right_domain now that Gemini results are scored
                 right_domain = [
                     (k, u, s, r) for k, u, s, r in scored
-                    if home_domain and tldextract.extract(u).registered_domain == home_domain and s >= 0
+                    if home_domain and _is_right_domain(u) and s >= 0
                 ]
             except Exception as exc:
                 msg = str(exc)
@@ -1402,6 +1434,31 @@ def main():
         # ── QA ────────────────────────────────────────────────────────────────
         qa_status = qa_check(best_url, logger)
 
+        # If the best URL is dead, try the next-best scored candidates.
+        # Exception: if we already landed on the right domain, trust it —
+        # many district servers block HTTP clients but the page is live.
+        if qa_status in ("✗ DEAD", "✗ TIMEOUT"):
+            best_on_right_domain = home_domain and _is_right_domain(best_url)
+            is_doc_url = bool(re.search(r'\.(pdf|xlsx)(\?.*)?$', best_url, re.IGNORECASE))
+            if best_on_right_domain and not is_doc_url:
+                logger.info("Row %d | QA failed but URL is on right domain — trusting it", sheet_row)
+                qa_status = "✓ HTML"
+            else:
+                fallbacks = sorted(
+                    [(k, u, s) for k, u, s, _ in scored if u != best_url and u not in ("NO_RESULT", "API_ERROR")],
+                    key=lambda x: x[2], reverse=True
+                )
+                for fb_key, fb_url, fb_score in fallbacks[:5]:
+                    fb_status = qa_check(fb_url, logger)
+                    if fb_status not in ("✗ DEAD", "✗ TIMEOUT"):
+                        logger.info("Row %d | Fallback from dead %s → %s (%s)", sheet_row, best_url, fb_url, fb_status)
+                        best_url   = fb_url
+                        best_key   = fb_key
+                        best_score = fb_score
+                        best_label = best_label + " +deadfallback"
+                        qa_status  = fb_status
+                        break
+
         # ── Tier-2: crawl HTML pages for a deeper document link ───────────────
         if qa_status == "✓ HTML":
             crawled = crawl_html_for_salary_doc(best_url, logger)
@@ -1416,7 +1473,14 @@ def main():
         # CDN-hosted docs are expected to live on a different domain — don't
         # fire Tier-3 unless the CDN URL contains a wrong-district path token.
         _best_url_lower = best_url.lower()
-        _is_wrong_cdn = best_domain in KNOWN_DOC_CDNS and any(t in _best_url_lower for t in WRONG_CDN_PATHS)
+        _is_wrong_cdn = (
+            best_domain in KNOWN_DOC_CDNS
+            and any(
+                t in _best_url_lower
+                and not (home_base and (home_base in t or t in home_base))
+                for t in WRONG_CDN_PATHS
+            )
+        )
         _is_wrong_domain = home_domain and best_domain and best_domain != home_domain and best_domain not in KNOWN_DOC_CDNS
         t3_upgraded = False
         if (_is_wrong_cdn or _is_wrong_domain) and not site_results:
@@ -1486,11 +1550,13 @@ def main():
                 url_lower = best_url.lower()
                 for bad_path in WRONG_CDN_PATHS:
                     if bad_path in url_lower:
-                        logger.warning(
-                            "Row %d | CDN path mismatch: URL contains '%s' (another district's path) — flagging as WRONG PATH",
-                            sheet_row, bad_path,
-                        )
-                        qa_status = "⚠ WRONG PATH"
+                        is_own = home_base and (home_base in bad_path or bad_path in home_base)
+                        if not is_own:
+                            logger.warning(
+                                "Row %d | CDN path mismatch: URL contains '%s' (another district's path) — flagging as WRONG PATH",
+                                sheet_row, bad_path,
+                            )
+                            qa_status = "⚠ WRONG PATH"
                         break
 
         logger.info("Row %d | QA: %s | time=%.1fs", sheet_row, qa_status, time.time() - row_start)
