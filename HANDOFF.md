@@ -2,6 +2,7 @@
 
 > **New session?** Read this file top to bottom before touching any script.
 > It is the authoritative project state document.
+> Last updated: 2026-04-23
 
 ---
 
@@ -68,6 +69,7 @@ district-compensation-plan/
 ├── search_urls.py              # Phase 1: URL search — writes cols F–O
 ├── classify_documents.py       # Phase 1: document classification — writes cols P–S
 ├── qa_pipeline.py              # Phase 1: orchestrated QA cleanup (run after any bulk search)
+├── verify_homepages.py         # Phase 1: one-time homepage audit — writes col AL; resume-safe
 ├── prepare_rerun.py            # Phase 1: pre-flight for full rerun — duplicates tab, clears cols, suggests test rows
 ├── remediate.py                # Phase 1: one-time fix script — COMPLETE, do not re-run
 ├── find_pio_contacts.py        # PIR Track: PIO email discovery — COMPLETE
@@ -89,7 +91,7 @@ district-compensation-plan/
 
 ---
 
-## Phase 1 — URL Search + Classification (RERUN IN PROGRESS)
+## Phase 1 — URL Search + Classification (READY FOR FULL RUN)
 
 ### Google Sheet: "Unique Districts" tab
 
@@ -114,11 +116,12 @@ district-compensation-plan/
 | Q | Doc_Pages | classify_documents.py | Page count |
 | R | Doc_Tables | classify_documents.py | Table count |
 | S | Doc_Notes | classify_documents.py | Keyword sample or error detail |
+| AL | Suggested_Homepage | verify_homepages.py | `✓ match`, suggested URL, or `no result` |
 
 Scripts write only their allowed column ranges. Column guard enforced in code — any write
 outside the allowed range raises `RuntimeError` and halts.
 
-### Doc_Class Breakdown (pre-rerun, as of 2026-04-16)
+### Doc_Class Breakdown (pre-full-run, as of 2026-04-18)
 
 | Doc_Class | Count | Notes |
 |-----------|-------|-------|
@@ -134,29 +137,30 @@ outside the allowed range raises `RuntimeError` and halts.
 Counts are from the pre-rerun pass. A full rerun with improved scoring is underway;
 these numbers will change.
 
-### Full Rerun Workflow
+### Current Status (as of 2026-04-23)
 
-A full clean rerun was triggered by two issues discovered in analysis:
-1. The old scoring model awarded 7pts to any PDF on the right domain — handbooks
-   scored identically to salary schedules. 27% of "high-confidence" rows had wrong docs.
-2. Multiple corruption passes from CDN path filter bugs left large-district rows with
-   incorrect documents.
+A full rerun of all 894 rows has NOT yet been run with the current scoring model.
+The 20-row test (top districts by enrollment) shows 16/19 clean results (84%).
 
-**Steps:**
+**Before running the full rerun, do this first:**
+- Column AL now contains homepage verification results from `verify_homepages.py`.
+- Review the 74 rows marked as mismatch and update column A with the correct homepage.
+- Priority: any col A value that is `esc14.net`, `esc17.net`, `esc18.net`, `txed.net`,
+  `thrillshare.com`, or another shared platform — those are wrong and will cause
+  WRONG DOMAIN results throughout the run.
+- See `SEARCH_ISSUES.md` for full detail on the search problem and what's fixed.
+
+**Steps to run:**
 ```bash
-# 1. Duplicate tab as backup, clear cols F–O, get 20 test row suggestions
-python prepare_rerun.py
+# 1. Review col AL mismatches and update col A (manual step)
 
-# 2. Test the new scoring model on those 20 rows
-python search_urls.py --rows <rows from step 1>
-
-# 3. Review results in the sheet. If good, run the full rerun:
+# 2. Run the full search (resume-safe — skips already-populated rows):
 python search_urls.py
 
-# 4. After the full run completes, re-classify all rows:
+# 3. After the full run completes, re-classify all rows:
 python classify_documents.py
 
-# 5. QA cleanup pass:
+# 4. QA cleanup pass:
 python qa_pipeline.py
 ```
 
@@ -172,14 +176,12 @@ python qa_pipeline.py
 The circuit breaker in `call_search()` automatically trips depleted backends for the
 lifetime of the process — no wasted retries on quota errors.
 
-### Scoring Model (as of 2026-04-17)
-
-Rewritten to use filename as the primary signal rather than the full URL+title+snippet.
+### Scoring Model (as of 2026-04-18)
 
 | Signal | Points | Notes |
 |--------|--------|-------|
 | PDF or XLSX file type | +3 | |
-| Domain match (homepage vs result) | +2 | |
+| Domain match (district homepage or own CDN path) | +2 | |
 | Year pattern (2026, 25-26, etc.) | +2 | |
 | Compensation keyword in **filename** | +2 | salary, compensation, pay_scale, matrix, etc. |
 | Compensation keyword in title/snippet | +1 | Only if filename didn't fire |
@@ -187,21 +189,31 @@ Rewritten to use filename as the primary signal rather than the full URL+title+s
 | Scribd URL | -3 | Documents gated behind login |
 | Wrong-doc keyword in **filename** | -3 | handbook, budget, cafr, agenda, minutes, etc. |
 | Wrong-doc keyword in title/snippet | -2 | Weaker signal; only fires if filename didn't |
+| Wrong-district CDN path | -5 | CDN URL whose path token belongs to another district |
 
-All queries now include `filetype:pdf` to filter at the search layer before scoring.
+**Best-result selection:** any result from the correct district domain (score >= 0)
+beats all wrong-domain results regardless of score. "Correct domain" includes CDN
+URLs whose path token matches the current district.
 
-**Why this matters:** the old model gave 7pts (pdf+domain+year) to any PDF on the
-right domain. Handbooks and salary schedules scored identically. The new model
-separates them by 5+ points when the filename keyword fires.
+**Search backends (run in parallel):**
+- R1–R10: Brave general query
+- S1–S10: Brave site-scoped query (`site:{district_homepage}`) — always runs
+- G1–Gn: Gemini 2.5 Flash grounding — conditional, only fires when Brave+site
+  found no right-domain result (~25% of rows). Budget guard trips on 402/429.
+
+**Dead-URL handling:**
+- HEAD 4xx → GET retry before declaring dead
+- Right-domain HTML page that fails all checks → trusted as `✓ HTML` (bot-blocking)
+- Dead document URL → fallback to next 5 scored candidates
 
 ### Search History
 
 - All ~895 rows processed via search_urls.py (multiple passes over several sessions).
 - `remediate.py` was run once to fix 38 failed rows (DEAD/TIMEOUT/REVIEW) — do not re-run.
-- Multiple QA cleanup passes were run to fix wrong-domain and CDN-path contamination.
-- CDN path filter bug caused ~179 large-district rows to be corrupted; Tavily recovery
-  was partial. Full rerun with Brave is the fix.
-- See "QA Cleanup" section below for the ongoing process.
+- Multiple QA cleanup passes run; scoring model rewritten April 16-18.
+- `verify_homepages.py` run April 18-19: 74 stale/wrong homepages identified in col AL.
+- Current search model tested on 20 rows: 16/19 (84%) clean. Full 894-row run pending.
+- See `SEARCH_ISSUES.md` for full change timeline and remaining issues.
 
 ---
 
@@ -320,7 +332,7 @@ find_pio_contacts.py write guard: cols D, F, H, J only.
 send_pir.py write guard: cols G, N only.
 check_pir_responses.py write guard: cols O, P, Q only.
 
-### Current PIR Status (as of 2026-04-16)
+### Current PIR Status (as of 2026-04-23 — no update since April 16)
 
 - **All 196 districts emailed** (188 original charters + 8 non-charter ISDs added manually)
 - **Follow-ups sent** to all districts with Doc Received or URL Received status
@@ -490,8 +502,14 @@ meaningful for complex ones.
 - **8 blank Doc_Class rows:** Seminole ISD, North Hopkins ISD, Munday CISD, Pettus ISD,
   Claude ISD, Coolidge ISD, McLean ISD, Panther Creek CISD — all have `⚠ REVIEW` with
   no URL. All are in the PIR bucket. Not worth a rerun.
-- **49 remaining WRONG DOMAIN rows:** small rural districts where search consistently
-  returns another district's document. Tier-3 domain search finds nothing on their domain.
-  These will be PIR bucket or manual lookup.
+- **Stale col A homepages:** 74 rows have outdated/wrong homepages (identified by
+  verify_homepages.py — see col AL). Until corrected, these rows will produce WRONG DOMAIN
+  results. Several have ESC shared-hosting domains (esc14.net, txed.net, etc.) that must
+  be replaced before the full run.
+- **WRONG DOMAIN false positive (row 12, North East ISD):** Tier-2 crawl correctly finds
+  their CloudFront CDN PDF, but QA flags it because the CDN URL doesn't contain a
+  recognizable district path token. The document is correct; the flag is wrong.
+- **REDIRECT rows (15, 21):** Arlington and Round Rock ISDs redirect to news/about pages.
+  The direct salary schedule link was not found by Tier-2 crawl.
 - **Generic addresses (info@, contact@):** valid PIR recipients if on the district's
   own domain. Not filtered out.
